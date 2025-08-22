@@ -21,6 +21,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import subprocess
+import random
 
 # ----- List names (top-level, no groups) -----
 BACKLOG  = "Scripture Memorization - Backlog"
@@ -100,6 +101,19 @@ DEFAULT_CONFIG = {
     "auto_add": {
         "every_n_days": 7   # 1 = daily, 7 = weekly, 0 = disabled
     }
+    ,
+    "obfuscation": {
+        "enabled": True,
+        "separator": "\n\n______________________________\n",
+        "schedule": [1.0, 0.75, 0.5, 0.35, 0.2],
+        "min_word_len": 3,
+        "keep_first_last": False,
+        "respect_punctuation": True,
+        "buffer_lines": 4,
+        "buffer_token": "."
+
+    }
+
 }
 
 def _ensure_config_dir():
@@ -162,6 +176,20 @@ def apply_config(cfg: dict):
     # Auto-add frequency
     global AUTO_ADD_EVERY_N_DAYS
     AUTO_ADD_EVERY_N_DAYS = int(cfg.get("auto_add", {}).get("every_n_days", DEFAULT_CONFIG["auto_add"]["every_n_days"]))
+
+    # Verse Obfuscation
+    global OBF_ENABLED, OBF_SEPARATOR, OBF_SCHEDULE, OBF_MIN_LEN, OBF_KEEP_FL, OBF_RESPECT_PUNCT
+    obf = cfg.get("obfuscation", {}) or {}
+    OBF_ENABLED = bool(obf.get("enabled", True))
+    OBF_SEPARATOR = obf.get("separator", DEFAULT_CONFIG["obfuscation"]["separator"])
+    OBF_SCHEDULE = list(obf.get("schedule", DEFAULT_CONFIG["obfuscation"]["schedule"]))
+    OBF_MIN_LEN = int(obf.get("min_word_len", DEFAULT_CONFIG["obfuscation"]["min_word_len"]))
+    OBF_KEEP_FL = bool(obf.get("keep_first_last", DEFAULT_CONFIG["obfuscation"]["keep_first_last"]))
+    OBF_RESPECT_PUNCT = bool(obf.get("respect_punctuation", DEFAULT_CONFIG["obfuscation"]["respect_punctuation"]))
+
+    global OBF_BUFFER_LINES, OBF_BUFFER_TOKEN
+    OBF_BUFFER_LINES = int(obf.get("buffer_lines", DEFAULT_CONFIG["obfuscation"]["buffer_lines"]))
+    OBF_BUFFER_TOKEN = str(obf.get("buffer_token", DEFAULT_CONFIG["obfuscation"]["buffer_token"]))
 
 
 
@@ -1079,6 +1107,8 @@ def advance_on_complete():
             set_due(MONTHLY, title, mdue)
             mark_incomplete_by_title(MONTHLY, title)
             _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, monthly_count=0, anchor_weekday=anchor)
+            if OBF_ENABLED:
+                _refresh_monthly_obfuscation(title, now)
             print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y 08:00')}")
             _append_csv_event(title, "monthly", "promoted", mdue.strftime('%Y-%m-%d 08:00'))
 
@@ -1107,6 +1137,8 @@ def advance_on_complete():
             set_due(MONTHLY, title, due)
             mark_incomplete_by_title(MONTHLY, title)
             _update_record(title, stage="monthly", monthly_count=mcount, anchor_weekday=anchor)
+            if OBF_ENABLED:
+                _refresh_monthly_obfuscation(title, now)
             print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')} ({mcount}/{MONTHLY_REPEATS})")
             _append_csv_event(title, "monthly", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
 
@@ -1403,6 +1435,135 @@ def _append_csv_event(title: str, stage: str, action: str, next_due: str = "") -
             w.writerow([ts, title, stage, action, next_due])
     except Exception as e:
         _append_log(f"[csv] ERROR {e}")
+
+# ====================================================================
+# Verse Obfuscation helpers
+# ====================================================================
+def _extract_full_text(note: str) -> str:
+    """
+    Return the full-text section: content after the LAST separator.
+    If none found, return the entire note trimmed.
+    """
+    note = (note or "").strip()
+    parts = note.rsplit(OBF_SEPARATOR, 1)
+    if len(parts) == 2:
+        return parts[1].strip()
+    return note
+
+
+_WORD_RE = re.compile(r"\b([A-Za-z][A-Za-z’']*[A-Za-z]|[A-Za-z])\b")
+
+def _obfuscate_text(full_text: str, ratio: float, seed: int) -> str:
+    """
+    Replace letters in a % of eligible words with underscores.
+    - Eligible: length >= OBF_MIN_LEN.
+    - Keep punctuation, spacing, and (optionally) first/last letters.
+    """
+    rnd = random.Random(seed)
+    words = _WORD_RE.findall(full_text)
+    # Build a set of indices to obfuscate according to ratio
+    eligible_idx = [i for i, w in enumerate(words) if len(w) >= OBF_MIN_LEN]
+    k = int(round(len(eligible_idx) * max(0.0, min(1.0, ratio))))
+    obf_set = set(rnd.sample(eligible_idx, k)) if k > 0 else set()
+
+def obfuscate_word(w: str) -> str:
+    # Full-word underscores if KEEP_FL is False; otherwise keep first/last.
+    if len(w) < OBF_MIN_LEN:
+        return w
+    if not OBF_KEEP_FL:
+        return "".join("_" if c.isalpha() else c for c in w)
+    chars = list(w)
+    if len(chars) >= 2:
+        core = ["_" if c.isalpha() else c for c in chars[1:-1]]
+        return chars[0] + "".join(core) + chars[-1]
+    return "".join("_" if c.isalpha() else c for c in chars)
+
+
+    # Reconstruct with regex sub to preserve spaces/punct exactly
+    idx = 0
+    def repl(m: re.Match) -> str:
+        nonlocal idx
+        w = m.group(0)
+        out = obfuscate_word(w) if idx in obf_set else w
+        idx += 1
+        return out
+
+    return _WORD_RE.sub(repl, full_text)
+
+def _note_with_obfuscation(full_text: str, ratio: float, seed: int) -> str:
+    obf = _obfuscate_text(full_text, ratio, seed) if ratio < 1.0 else full_text
+    # Build dot buffer: blank line, ".", blank line, ".", ...
+    buf_lines = []
+    for _ in range(max(0, OBF_BUFFER_LINES)):
+        buf_lines.append("")                 # blank line
+        buf_lines.append(OBF_BUFFER_TOKEN)   # "."
+    buffer_block = ("\n".join(buf_lines) + "\n") if buf_lines else ""
+    # Canonical layout: obfuscated block, blank line, buffer, separator, full text
+    return f"{obf.strip()}\n\n{buffer_block}{OBF_SEPARATOR}{full_text.strip()}"
+
+
+def _weekly_seed_for(title: str, now: datetime) -> int:
+    # Stable change weekly: ISO year+week
+    iso_year, iso_week, _ = now.isocalendar()
+    return hash((title.casefold(), iso_year, iso_week)) & 0x7FFFFFFF
+
+def _ratio_for_monthly_count(mcount: int) -> float:
+    """
+    Map the current Monthly completion count (mcount) onto the obfuscation schedule,
+    scaled across the full MONTHLY_REPEATS range. Works for any schedule length.
+
+    - If schedule has N points [r0, r1, ... rN-1], we interpolate linearly across them.
+    - If MONTHLY_REPEATS changes (e.g., 12, 24, 36), the ramp stretches automatically.
+    - If N == 1, always return that single value.
+    """
+    if not OBF_SCHEDULE:
+        return 1.0
+    if len(OBF_SCHEDULE) == 1:
+        return float(OBF_SCHEDULE[0])
+
+    # Normalize progress across the Monthly phase (0.0 at entry → 1.0 at final repeat)
+    # mcount is how many Monthly completions we've recorded so far.
+    # Clamp to [0, 1] to be safe for edge cases.
+    denom = max(1, MONTHLY_REPEATS - 1)
+    p = max(0.0, min(1.0, float(mcount) / float(denom)))
+
+    # Interpolate within the schedule points
+    steps = len(OBF_SCHEDULE) - 1
+    x = p * steps
+    i = int(x)  # left index
+    if i >= steps:
+        return float(OBF_SCHEDULE[-1])
+    frac = x - i
+    a = float(OBF_SCHEDULE[i])
+    b = float(OBF_SCHEDULE[i + 1])
+    return a * (1.0 - frac) + b * frac
+
+
+def _ensure_dual_note_for_monthly(title: str, now: datetime) -> bool:
+    ln, it = _find_item_across_lists(title)
+    if ln != MONTHLY or not it:
+        return False
+    full = _extract_full_text(it["body"])
+    if not full:
+        full = fetch_scripture_text(title) or ""
+        if not full:
+            return False
+    rec = _get_or_init_record(title)
+    mcount = int(rec.get("monthly_count", 0))
+    ratio = _ratio_for_monthly_count(mcount)
+    seed = _weekly_seed_for(title, now)
+    new_body = _note_with_obfuscation(full, ratio, seed)
+    return set_body_by_id(MONTHLY, it["id"], new_body)
+
+
+def _refresh_monthly_obfuscation(title: str, now: datetime) -> None:
+    if not OBF_ENABLED:
+        return
+    try:
+        _ensure_dual_note_for_monthly(title, now)
+    except Exception as e:
+        _append_log(f"[obfuscate] ERROR for '{title}': {e}")
+
 
 
 # ====================================================================
