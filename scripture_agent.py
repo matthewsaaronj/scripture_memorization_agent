@@ -6,43 +6,168 @@ Scripture Memorization Agent for Apple Reminders
 - Lists: Backlog, Daily, Weekly, Monthly
 - Backlog → Daily (no duplicates), due set to next morning 8:00 AM
 - Cadence per Featherstone: Daily repeats then Weekly then Monthly
-- Notes auto-fill from local cache file (can be swapped to API later)
+- Notes auto-fill:
+    * Fetch from scripture API(s) based on the reminder title (single contiguous ref)
+    * Multi-verse notes are formatted as separate paragraphs with one blank line between
 """
 
 import os
 import sys
 import json
-import subprocess
+import calendar
+import re
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict, Any
+import subprocess
 
 # ----- List names (top-level, no groups) -----
 BACKLOG  = "Scripture Memorization - Backlog"
 DAILY    = "Scripture Memorization - Daily"
 WEEKLY   = "Scripture Memorization - Weekly"
 MONTHLY  = "Scripture Memorization - Monthly"
+MASTERED = "Scripture Memorization - Mastered"
 
 # ----- Cadence thresholds (Featherstone-style) -----
 DAILY_REPEATS   = 7   # review daily for 7 days (set to 2 for quick testing)
 WEEKLY_REPEATS  = 4   # review weekly for 4 weeks (set to 2 for quick testing)
+MONTHLY_REPEATS = 24  # ~2 years in Monthly
+
+# Mastered expanding refresh: then yearly thereafter
+MASTERED_REVIEW_MONTHS = [3, 6, 12]
+MASTERED_YEARLY_INTERVAL = 12
 
 # ----- State file for cadence tracking -----
 STATE_PATH = os.path.expanduser("~/.scripture_agent/state.json")
 
-# ----- Local verse cache for notes autofill (simple text file) -----
-VERSE_CACHE_PATH = os.path.expanduser("~/.scripture_agent/verses.txt")
-# Each line:  <reference>::<plain verse text>
-# Example:
-# John 3:16::For God so loved the world...
+# ----- Scripture API endpoints -----
+# LDS canon capable; expects spaces as '+' in q=... (use urlencode → quote_plus)
+NEPHI_API_BASE = "https://api.nephi.org/scriptures/"
+# Bible-only fallback (KJV); supports refs like "John 3:16-17"
+BIBLE_API_BASE = "https://bible-api.com/"
 
-# ----- AppleScript runner -----
+# ----- Auto-add frequency gate -----
+# Add a *new* verse at most once every N days when you run `new-verse`
+# (Backlog items still move any time you run it; the gate only controls
+# using ChatGPT to create a verse when Backlog is empty.)
+AUTO_ADD_EVERY_N_DAYS = 0  # set to 1 for daily, 7 for weekly, 0 to disable gate
+
+
+
+# ====================================================================
+# AppleScript runner
+# ====================================================================
 def run_as(script: str, *args: str) -> str:
     return subprocess.run(
         ["osascript", "-e", script, *args],
         check=True, capture_output=True, text=True
     ).stdout.strip()
 
-# ----- Readers -----
+# ========= Config (JSON, no deps) =========
+CONFIG_DIR  = os.path.expanduser("~/.scripture_agent")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+LOG_PATH = os.path.join(CONFIG_DIR, "agent.log")
+
+def _append_log(line: str) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
+
+
+DEFAULT_CONFIG = {
+    "lists": {
+        "backlog":  "Scripture Memorization - Backlog",
+        "daily":    "Scripture Memorization - Daily",
+        "weekly":   "Scripture Memorization - Weekly",
+        "monthly":  "Scripture Memorization - Monthly",
+        "mastered": "Scripture Memorization - Mastered"
+    },
+    "cadence": {
+        "daily_repeats":   7,   # change without code edits
+        "weekly_repeats":  4,
+        "monthly_repeats": 24
+    },
+    "mastered": {
+        "review_months":   [3, 6, 12],  # expanding refresh
+        "yearly_interval": 12
+    },
+    "auto_add": {
+        "every_n_days": 7   # 1 = daily, 7 = weekly, 0 = disabled
+    }
+}
+
+def _ensure_config_dir():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+def _load_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[config] failed to read {path}: {e}")
+        return None
+
+def _save_json(path: str, data: dict):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[config] failed to write {path}: {e}")
+
+def load_or_init_config() -> dict:
+    """
+    Load config from ~/.scripture_agent/config.json, creating it with defaults
+    if missing. Returns the config dict.
+    """
+    _ensure_config_dir()
+    cfg = _load_json(CONFIG_PATH)
+    if cfg is None:
+        cfg = DEFAULT_CONFIG
+        _save_json(CONFIG_PATH, cfg)
+        print(f"[config] created default config at {CONFIG_PATH}")
+    return cfg
+
+def apply_config(cfg: dict):
+    """
+    Copy config values into module-level globals so existing code keeps working.
+    Call this once at startup.
+    """
+    # Lists
+    global BACKLOG, DAILY, WEEKLY, MONTHLY, MASTERED
+    BACKLOG  = cfg.get("lists", {}).get("backlog",  DEFAULT_CONFIG["lists"]["backlog"])
+    DAILY    = cfg.get("lists", {}).get("daily",    DEFAULT_CONFIG["lists"]["daily"])
+    WEEKLY   = cfg.get("lists", {}).get("weekly",   DEFAULT_CONFIG["lists"]["weekly"])
+    MONTHLY  = cfg.get("lists", {}).get("monthly",  DEFAULT_CONFIG["lists"]["monthly"])
+    MASTERED = cfg.get("lists", {}).get("mastered", DEFAULT_CONFIG["lists"]["mastered"])
+
+    # Cadence
+    global DAILY_REPEATS, WEEKLY_REPEATS, MONTHLY_REPEATS
+    DAILY_REPEATS   = int(cfg.get("cadence", {}).get("daily_repeats",   DEFAULT_CONFIG["cadence"]["daily_repeats"]))
+    WEEKLY_REPEATS  = int(cfg.get("cadence", {}).get("weekly_repeats",  DEFAULT_CONFIG["cadence"]["weekly_repeats"]))
+    MONTHLY_REPEATS = int(cfg.get("cadence", {}).get("monthly_repeats", DEFAULT_CONFIG["cadence"]["monthly_repeats"]))
+
+    # Mastered schedule
+    global MASTERED_REVIEW_MONTHS, MASTERED_YEARLY_INTERVAL
+    MASTERED_REVIEW_MONTHS = list(cfg.get("mastered", {}).get("review_months",   DEFAULT_CONFIG["mastered"]["review_months"]))
+    MASTERED_YEARLY_INTERVAL = int(cfg.get("mastered", {}).get("yearly_interval", DEFAULT_CONFIG["mastered"]["yearly_interval"]))
+
+    # Auto-add frequency
+    global AUTO_ADD_EVERY_N_DAYS
+    AUTO_ADD_EVERY_N_DAYS = int(cfg.get("auto_add", {}).get("every_n_days", DEFAULT_CONFIG["auto_add"]["every_n_days"]))
+
+
+
+# ====================================================================
+# Readers
+# ====================================================================
 def list_reminders(list_name: str):
     """
     Returns [{'id': str, 'name': str, 'body': str, 'completed': bool, 'due': str}]
@@ -128,7 +253,9 @@ def list_reminders(list_name: str):
         })
     return items
 
-# ----- Writers -----
+# ====================================================================
+# Writers
+# ====================================================================
 def set_notes(list_name: str, title: str, notes: str) -> bool:
     script = r'''
     on run argv
@@ -155,6 +282,26 @@ def set_notes(list_name: str, title: str, notes: str) -> bool:
     '''
     res = run_as(script, list_name, title, notes)
     return res == "OK"
+
+def set_body_by_id(list_name: str, rem_id: str, body: str) -> bool:
+    script = r'''
+    on run argv
+      set listName to item 1 of argv
+      set rid to item 2 of argv
+      set theBody to item 3 of argv
+      tell application "Reminders"
+        set theList to first list whose name is listName
+        try
+          set r to first reminder of theList whose id is rid
+          set body of r to theBody
+          return "OK"
+        on error
+          return "NOT_FOUND"
+        end try
+      end tell
+    end run
+    '''
+    return run_as(script, list_name, rem_id, body) == "OK"
 
 def set_due(list_name: str, title: str, due_dt: datetime) -> bool:
     due_str = due_dt.strftime("%m/%d/%Y %H:%M:%S")
@@ -284,33 +431,570 @@ def mark_incomplete_by_title(list_name: str, title: str) -> bool:
         return False
     return mark_incomplete_by_id(list_name, m["id"])
 
+# ====================================================================
+# Scripture HTTP helpers (no extra deps)
+# ====================================================================
 
+# --- Reference parsing & overlap detection ---
+
+# Basic parser for refs like:
+#   "2 Nephi 2:25" or "2 Nephi 2:25-27" (en dash or hyphen)
+_REF_PARSE = re.compile(
+    r"^\s*([A-Za-z0-9&’' .\-]+?)\s+(\d+)\s*:\s*(\d+)(?:\s*[-–]\s*(\d+))?\s*$",
+    re.IGNORECASE
+)
+
+def _normalize_book_name(book: str) -> str:
+    """Normalize book names to improve match rate across aliases."""
+    b = (book or "").strip()
+    b_cf = b.casefold().replace("–", "-").replace("—", "-")
+    # Map common aliases
+    aliases = {
+        "d&c": "Doctrine and Covenants",
+        "d. & c.": "Doctrine and Covenants",
+        "dc": "Doctrine and Covenants",
+        "doctrine & covenants": "Doctrine and Covenants",
+        "doctrine and covenants": "Doctrine and Covenants",
+    }
+    if b_cf in aliases:
+        return aliases[b_cf]
+    # Collapse multiple spaces; title-case numbers + words reasonably
+    b_clean = re.sub(r"\s{2,}", " ", b).strip()
+    return b_clean
+
+def parse_reference(ref: str):
+    """
+    Return (book:str, chapter:int, start:int, end:int) or None if unparseable.
+    Only supports a single chapter (your flow assumes contiguous within a chapter).
+    """
+    m = _REF_PARSE.match((ref or "").replace("—", "-").replace("–", "-"))
+    if not m:
+        return None
+    book = _normalize_book_name(m.group(1))
+    chapter = int(m.group(2))
+    v_start = int(m.group(3))
+    v_end = int(m.group(4)) if m.group(4) else v_start
+    if v_end < v_start:
+        v_end = v_start
+    return (book, chapter, v_start, v_end)
+
+def ranges_overlap(a, b) -> bool:
+    """
+    True if same book+chapter and verse ranges intersect in any way
+    (subset, superset, or partial overlap).
+    """
+    if a is None or b is None:
+        return False
+    (abook, ach, as_, ae) = a
+    (bbook, bch, bs, be) = b
+    # same normalized book + chapter
+    if _normalize_book_name(abook).casefold() != _normalize_book_name(bbook).casefold():
+        return False
+    if ach != bch:
+        return False
+    return not (ae < bs or be < as_)
+
+def _titles_across_all_lists() -> list:
+    """Collect all titles from Daily/Weekly/Monthly/Backlog."""
+    titles = []
+    for ln in [DAILY, WEEKLY, MONTHLY, BACKLOG]:
+        try:
+            titles += [x["name"] for x in list_reminders(ln)]
+        except Exception:
+            pass
+    return titles
+
+def ref_overlaps_anywhere(candidate_ref: str) -> Optional[str]:
+    """
+    Return the first existing title that overlaps candidate_ref, else None.
+    """
+    c_parsed = parse_reference(candidate_ref)
+    if not c_parsed:
+        return None
+    for t in _titles_across_all_lists():
+        e_parsed = parse_reference(t)
+        if e_parsed and ranges_overlap(c_parsed, e_parsed):
+            return t
+    return None
+
+
+def _http_get_json(url: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = resp.read()
+        return json.loads(data.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+def _normalize_reference_for_nephi(ref: str) -> str:
+    # unify dash, collapse whitespace
+    ref = (ref or "").strip().replace("–", "-")
+    ref = re.sub(r"\s+", " ", ref)
+    return ref
+
+# Clean & format helpers for verses
+_LEADING_VERSE_NUM_RE = re.compile(r"^\s*(\d+[:\u00A0\s]+)?(\d+)\s+")
+_BRACKETED_NUM_RE = re.compile(r"^\s*\[?\d+\]?\s*")
+
+def _clean_line(s: str) -> str:
+    """Remove leading verse numbers/footnote markers; normalize spaces."""
+    s = s.replace("\u00A0", " ")
+    s = s.strip()
+    s = _LEADING_VERSE_NUM_RE.sub("", s)
+    s = _BRACKETED_NUM_RE.sub("", s)
+    s = re.sub(r"^[a-z]\s+", "", s)  # strip leading footnote letters like 'a'
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+def _format_verses_paragraphs(verses: List[str]) -> str:
+    """Join each verse as its own paragraph with a single blank line between."""
+    cleaned = []
+    for v in verses:
+        if not v:
+            continue
+        c = _clean_line(v)
+        if c:
+            cleaned.append(c)
+    return "\n\n".join(cleaned)
+
+def _try_nephi_api(reference: str) -> Optional[str]:
+    """
+    Fetch LDS scripture text via api.nephi.org.
+    Spaces must be '+' in q=... (urlencode -> quote_plus).
+    """
+    ref = _normalize_reference_for_nephi(reference)
+    query = urllib.parse.urlencode({"q": ref})  # spaces -> '+'
+    url = f"{NEPHI_API_BASE}?{query}"
+
+    data = _http_get_json(url)
+    if not data:
+        return None
+
+    verses: List[str] = []
+
+    # Correct shape per docs/example: {"scriptures": [ { "text": "..." }, ... ]}
+    scr = data.get("scriptures")
+    if isinstance(scr, list):
+        for v in scr:
+            t = v.get("text")
+            if isinstance(t, str) and t.strip():
+                verses.append(t)
+
+    if not verses:
+        return None
+
+    return _format_verses_paragraphs(verses)
+
+
+def _try_bible_api(reference: str) -> Optional[str]:
+    """
+    Bible-only (KJV) via bible-api.com/<ref>.
+    JSON shape: {"verses":[{"text":"..."}], ...}
+    """
+    q = urllib.parse.quote(reference.strip())
+    url = f"{BIBLE_API_BASE}{q}"
+    data = _http_get_json(url)
+    if not data:
+        return None
+
+    verses_field = data.get("verses")
+    verses: List[str] = []
+    if isinstance(verses_field, list):
+        for v in verses_field:
+            t = v.get("text")
+            if isinstance(t, str) and t.strip():
+                verses.append(t)
+
+    if not verses:
+        return None
+
+    return _format_verses_paragraphs(verses)
+
+def fetch_scripture_text(reference: str) -> Optional[str]:
+    """
+    Return scripture text as paragraphs (blank line between verses).
+    No local cache. Try LDS-capable provider first, then Bible-only fallback.
+    Prints a short debug line so you can see what succeeded/failed.
+    """
+    ref = (reference or "").strip()
+    if not ref:
+        print("[fetch] empty reference, skipping")
+        return None
+
+    txt = _try_nephi_api(ref)
+    if txt:
+        print(f"[fetch] OK via LDS provider for '{ref}'")
+        return txt
+    else:
+        print(f"[fetch] LDS provider had no result for '{ref}'")
+
+    txt = _try_bible_api(ref)
+    if txt:
+        print(f"[fetch] OK via Bible-only provider for '{ref}'")
+        return txt
+
+    print(f"[fetch] no provider could resolve '{ref}'")
+    return None
+
+def _openai_chat(prompt: str, model: str = "gpt-4o-mini") -> Optional[str]:
+    """
+    Minimal Chat Completions call.
+    Requires env var OPENAI_API_KEY.
+    Returns the assistant text or None.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        print("[chatgpt] OPENAI_API_KEY not set; skipping")
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a concise assistant that only replies with a single contiguous Latter-day Saint scripture reference in the format 'Book Chapter:Verse' or 'Book Chapter:Start-End'. No commentary."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.5,
+            }).encode("utf-8")
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return (text or "").strip()
+    except Exception as e:
+        print(f"[chatgpt] error: {e}")
+        return None
+
+_REF_RE = re.compile(r"([A-Za-z0-9&’' .\-]+)\s+(\d+):(\d+(?:-\d+)?)")
+
+def _extract_reference(s: str) -> Optional[str]:
+    if not s:
+        return None
+    m = _REF_RE.search(s.replace("–","-"))
+    if not m:
+        return None
+    # Normalize spacing in the book part (e.g., "1 Nephi", "Doctrine and Covenants")
+    book = re.sub(r"\s+", " ", m.group(1)).strip()
+    ch   = m.group(2)
+    vv   = m.group(3)
+    return f"{book} {ch}:{vv}"
+
+
+def suggest_reference_via_chatgpt(topic: Optional[str] = None, exclusions: Optional[list[str]] = None) -> Optional[str]:
+    avoid_list = exclusions or []
+    avoid_block = ""
+    if avoid_list:
+        # Keep the block compact; the overlap checker on our side still enforces
+        joined = "\n".join(f"- {t}" for t in avoid_list[:50])  # cap for brevity
+        avoid_block = (
+            "Avoid suggesting any scripture that is the same as OR overlaps any of the following references "
+            "(treat overlaps as sharing any verse in common):\n"
+            f"{joined}\n\n"
+        )
+
+    user_prompt = (
+        (f"Topic: {topic.strip()}\n" if topic else "") +
+        avoid_block +
+        "Return exactly ONE Latter-day Saint scripture reference that is a single contiguous passage (e.g., 'Mosiah 2:21-22'). "
+        "Do NOT include multiple disjoint references. "
+        "Do NOT include commentary—reply with only the reference."
+    )
+
+    text = _openai_chat(user_prompt, model="gpt-4o-mini")  # we’ll keep one call
+    ref = _extract_reference(text or "")
+    return ref
+
+
+# ====================================================================
+# Notes fill (ID-based, normalized matching)
+# ====================================================================
 def _norm_title_key(t: str) -> str:
     # normalize for matching: trim, casefold, unify en-dash to hyphen
     return (t or "").strip().casefold().replace("–", "-")
 
-def set_body_by_id(list_name: str, rem_id: str, body: str) -> bool:
-    script = r'''
+def ensure_notes_for(list_name: str, title: str) -> bool:
+    """
+    If the reminder's notes are blank, fetch text (API) and set notes.
+    Matching is normalized (casefolded, dash-normalized). Writes by ID.
+    """
+    want = _norm_title_key(title)
+    items = list_reminders(list_name)
+
+    # find by normalized title
+    m = None
+    for x in items:
+        if _norm_title_key(x["name"]) == want:
+            m = x
+            break
+    if not m:
+        return False
+
+    if (m["body"] or "").strip():
+        return True  # already has notes
+
+    text = fetch_scripture_text(m["name"]) or fetch_scripture_text(title)
+    if not text:
+        return False  # no API result
+
+    return set_body_by_id(list_name, m["id"], text.strip())
+
+# ====================================================================
+# Backlog → Daily (clean duplicates, move one, set due 8am, init state, fill notes)
+# ====================================================================
+def _norm_title(t: str) -> str:
+    return (t or "").strip().casefold().replace("–", "-")
+
+from typing import Optional
+
+def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[str]:
+    """
+    1) Clean ALL exact duplicates in Backlog that already exist in Daily/Weekly/Monthly.
+    2) Clean Backlog items that OVERLAP any existing title across lists (range-overlap).
+    3) Move the FIRST remaining Backlog item into Daily.
+       - Set due to next morning 08:00
+       - Init cadence state with today's weekday (anchor)
+       - Fill notes via API if blank
+    4) If Backlog is empty and frequency gate allows:
+       - Ask ChatGPT once for a contiguous reference (optionally guided by `topic`)
+       - Pass an exclusions list to avoid duplicates/overlaps
+       - If it still overlaps, skip (no further model calls)
+       - Create in Daily, set due 8:00, init state, fill notes
+    Returns the moved/created title, or None if nothing done.
+    """
+    now = datetime.now()
+
+    # Collect existing titles (normalized string compare for exact dup pass)
+    daily_titles   = {_norm_title(x["name"]) for x in list_reminders(DAILY)}
+    weekly_titles  = {_norm_title(x["name"]) for x in list_reminders(WEEKLY)}
+    monthly_titles = {_norm_title(x["name"]) for x in list_reminders(MONTHLY)}
+    exists_elsewhere = daily_titles | weekly_titles | monthly_titles
+
+    # -------- Pass 1: clean exact duplicates from Backlog --------
+    backlog_items = list_reminders(BACKLOG)
+    for r in backlog_items:
+        title = r["name"].strip()
+        if _norm_title(title) in exists_elsewhere:
+            delete_by_id(BACKLOG, r["id"])
+            print(f"Cleaned duplicate from Backlog: {title}")
+
+    # -------- Pass 2 (optional): clean overlapping Backlog items --------
+    backlog_items = list_reminders(BACKLOG)  # refresh after exact dup cleanup
+    for r in backlog_items:
+        title = r["name"].strip()
+        overlapping = ref_overlaps_anywhere(title)
+        # If it overlaps *and* isn't the exact same normalized string, remove it
+        if overlapping and _norm_title(title) != _norm_title(overlapping):
+            delete_by_id(BACKLOG, r["id"])
+            print(f"Cleaned overlapping Backlog item: {title} (overlaps {overlapping})")
+
+    # -------- Pass 3: move the first remaining Backlog item to Daily --------
+    for r in list_reminders(BACKLOG):
+        title = r["name"].strip()
+
+        # Create in Daily
+        create_script = r'''
+        on run argv
+          set listName to item 1 of argv
+          set theTitle to item 2 of argv
+          set theBody to item 3 of argv
+          tell application "Reminders"
+            set theList to first list whose name is listName
+            make new reminder at end of reminders of theList with properties {name:theTitle, body:theBody}
+          end tell
+        end run
+        '''
+        run_as(create_script, DAILY, title, r["body"])
+
+        # Delete from Backlog
+        delete_by_id(BACKLOG, r["id"])
+
+        # Due next morning 8:00 + init cadence + ensure notes
+        set_due_next_morning_8am(DAILY, title)
+        _get_or_init_record(title, anchor_weekday=now.weekday())
+        ensure_notes_for(DAILY, title)
+
+        print(f"New verse moved from Backlog → Daily (next review at 8:00 AM): {title}")
+        return title
+
+    # -------- Pass 4: Backlog empty → maybe ask ChatGPT (frequency gate) --------
+    if not _chatgpt_allowed_today(now):
+        print("[new-verse] Backlog empty, but frequency gate prevents auto-add today.")
+        return None
+
+    # One call with explicit exclusions to avoid overlaps/duplicates
+    exclusions = existing_refs_across_all_lists()
+    candidate = suggest_reference_via_chatgpt(topic=topic, exclusions=exclusions)
+    if not candidate:
+        print("[new-verse] ChatGPT did not provide a usable reference.")
+        return None
+
+    # Hard guard: if it still overlaps, stop (no extra API calls)
+    overlapping = ref_overlaps_anywhere(candidate)
+    if overlapping:
+        print(f"[new-verse] ChatGPT suggested '{candidate}', but it overlaps existing '{overlapping}'. "
+              f"Skipping add to avoid duplicates (no further calls).")
+        return None
+
+    # Create in Daily with empty body first
+    create_script = r'''
     on run argv
       set listName to item 1 of argv
-      set rid to item 2 of argv
-      set theBody to item 3 of argv
+      set theTitle to item 2 of argv
       tell application "Reminders"
         set theList to first list whose name is listName
-        try
-          set r to first reminder of theList whose id is rid
-          set body of r to theBody
-          return "OK"
-        on error
-          return "NOT_FOUND"
-        end try
+        make new reminder at end of reminders of theList with properties {name:theTitle, body:""}
       end tell
     end run
     '''
-    return run_as(script, list_name, rem_id, body) == "OK"
+    run_as(create_script, DAILY, candidate)
+
+    set_due_next_morning_8am(DAILY, candidate)
+    _get_or_init_record(candidate, anchor_weekday=now.weekday())
+    ensure_notes_for(DAILY, candidate)  # fetch exact text via API
+    _set_last_auto_added_date(now)
+
+    print(f"[ChatGPT] Added new verse to Daily (next review at 8:00 AM): {candidate}")
+    return candidate
 
 
-# ----- Move (copy → delete by ID) -----
+
+# ====================================================================
+# Cadence state helpers
+# =============================== =====================================
+def _load_state() -> dict:
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"verses": {}}
+
+def _save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+def _get_or_init_record(title: str, *, anchor_weekday: Optional[int] = None) -> dict:
+    key = _norm_title(title)
+    state = _load_state()
+    rec = state["verses"].get(key)
+    if rec is None:
+        rec = {
+            "title": title.strip(),
+            "stage": "daily",       # daily | weekly | monthly | mastered
+            "daily_count": 0,
+            "weekly_count": 0,
+            "monthly_count": 0,
+            "mastered_count": 0,
+            "anchor_weekday": anchor_weekday if anchor_weekday is not None else datetime.now().weekday(),
+        }
+        state["verses"][key] = rec
+        _save_state(state)
+    return rec
+
+def _update_record(title: str, **changes) -> None:
+    """
+    Upsert cadence state for a given title. Initializes missing fields with sane defaults,
+    then applies keyword changes and saves.
+    """
+    key = _norm_title(title)
+    state = _load_state()
+
+    # Initialize if missing
+    rec = state["verses"].setdefault(key, {
+        "title": title.strip(),
+        "stage": "daily",          # daily | weekly | monthly | mastered
+        "daily_count": 0,
+        "weekly_count": 0,
+        "monthly_count": 0,
+        "mastered_count": 0,
+        "anchor_weekday": datetime.now().weekday(),
+    })
+
+    # Apply updates
+    rec.update(changes)
+
+    _save_state(state)
+
+
+def _get_last_auto_added_date() -> Optional[datetime]:
+    state = _load_state()
+    iso = state.get("last_auto_added")
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except Exception:
+        return None
+
+def _set_last_auto_added_date(d: datetime) -> None:
+    state = _load_state()
+    state["last_auto_added"] = d.isoformat()
+    _save_state(state)
+
+def _chatgpt_allowed_today(now: datetime) -> bool:
+    if AUTO_ADD_EVERY_N_DAYS <= 0:
+        return True
+    last = _get_last_auto_added_date()
+    if not last:
+        return True
+    return (now.date() - last.date()).days >= AUTO_ADD_EVERY_N_DAYS
+
+def _first_weekday_on_or_after(year: int, month: int, weekday: int, start_day: int = 1) -> datetime:
+    """
+    weekday: 0=Mon ... 6=Sun (matches Python's datetime.weekday())
+    Returns a datetime at 08:00 on the first given weekday on/after start_day.
+    """
+    d = datetime(year, month, max(1, start_day), 8, 0, 0)
+    delta = (weekday - d.weekday()) % 7
+    return d + timedelta(days=delta)
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    y = dt.year + (dt.month - 1 + months) // 12
+    m = (dt.month - 1 + months) % 12 + 1
+    # clamp day to last day of target month
+    last_day = calendar.monthrange(y, m)[1]
+    day = min(dt.day, last_day)
+    return dt.replace(year=y, month=m, day=day)
+
+def next_same_weekday_in_n_months_8am(anchor_weekday: int, base: datetime, months_ahead: int) -> datetime:
+    """
+    Move ~N months ahead, then choose the first occurrence of the anchor weekday
+    ON OR AFTER that same day-of-month, at 08:00 local.
+
+    Example:
+      base = Thu Aug 21, 2025; anchor_weekday = Thu (3); months_ahead = 1
+      target month = September; start_day = 21
+      -> first Thursday on/after Sep 21, 2025 (which is Sep 25, 2025) at 08:00
+    """
+    target = _add_months(base, months_ahead)
+    return _first_weekday_on_or_after(
+        target.year,
+        target.month,
+        anchor_weekday,
+        start_day=target.day
+    )
+
+# ====================================================================
+# Cadence date helpers
+# ====================================================================
+def next_morning_8am(base: datetime) -> datetime:
+    return (base + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+
+def next_same_weekday_8am(anchor_weekday: int, base: datetime) -> datetime:
+    days_ahead = (anchor_weekday - base.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    target = base + timedelta(days=days_ahead)
+    return target.replace(hour=8, minute=0, second=0, microsecond=0)
+
+# ====================================================================
+# Advance-on-complete (cadence-aware)
+# ====================================================================
 def move_by_title(from_list: str, to_list: str, title: str) -> bool:
     wanted = title.strip().lower()
     items = list_reminders(from_list)
@@ -336,170 +1020,6 @@ def move_by_title(from_list: str, to_list: str, title: str) -> bool:
     delete_by_id(from_list, match["id"])
     return True
 
-# ----- Notes autofill (local-cache for now) -----
-def _read_local_verse_cache() -> dict:
-    os.makedirs(os.path.dirname(VERSE_CACHE_PATH), exist_ok=True)
-    if not os.path.exists(VERSE_CACHE_PATH):
-        open(VERSE_CACHE_PATH, "a", encoding="utf-8").close()
-        return {}
-    cache = {}
-    with open(VERSE_CACHE_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "::" not in line:
-                continue
-            ref, text = line.split("::", 1)
-            cache[ref.strip()] = text.strip()
-    return cache
-
-def fetch_scripture_text(reference: str) -> Optional[str]:
-    """For now: look up from local cache file. Returns plain verse text or None."""
-    cache = _read_local_verse_cache()
-    return cache.get(reference.strip())
-
-def ensure_notes_for(list_name: str, title: str) -> bool:
-    """
-    If the reminder's notes are blank, fetch text from cache and set notes.
-    Matching is normalized (casefolded, dash-normalized). Writes by ID.
-    """
-    want = _norm_title_key(title)
-    items = list_reminders(list_name)
-
-    # find by normalized title
-    m = None
-    for x in items:
-        if _norm_title_key(x["name"]) == want:
-            m = x
-            break
-    if not m:
-        return False
-
-    if (m["body"] or "").strip():
-        return True  # already has notes
-
-    text = fetch_scripture_text(m["name"]) or fetch_scripture_text(title)
-    if not text:
-        return False  # no cached text yet
-
-    return set_body_by_id(list_name, m["id"], text.strip())
-
-
-# ----- Backlog → Daily (clean duplicates, move one, set due 8am, init state) -----
-def _norm_title(t: str) -> str:
-    return (t or "").strip().casefold().replace("–", "-")
-
-def maybe_add_new_verse_from_backlog() -> Optional[str]:
-    """
-    1) Clean ALL duplicates in Backlog that already exist in Daily/Weekly/Monthly.
-    2) Move the FIRST remaining Backlog item into Daily.
-       - Set due date to next morning at 08:00.
-       - Initialize cadence state with anchor weekday.
-       - Fill notes from local cache if blank (no-op if not present yet).
-    Returns the moved title, or None if nothing moved.
-    """
-    daily_titles   = {_norm_title(x["name"]) for x in list_reminders(DAILY)}
-    weekly_titles  = {_norm_title(x["name"]) for x in list_reminders(WEEKLY)}
-    monthly_titles = {_norm_title(x["name"]) for x in list_reminders(MONTHLY)}
-    exists_elsewhere = daily_titles | weekly_titles | monthly_titles
-
-    # Pass 1: clean all duplicates from Backlog
-    backlog_items = list_reminders(BACKLOG)
-    for r in backlog_items:
-        title = r["name"].strip()
-        if _norm_title(title) in exists_elsewhere:
-            delete_by_id(BACKLOG, r["id"])
-            print(f"Cleaned duplicate from Backlog: {title}")
-
-    # Pass 2: move the first remaining Backlog item to Daily
-    for r in list_reminders(BACKLOG):
-        title = r["name"].strip()
-
-        # create in Daily
-        create_script = r'''
-        on run argv
-          set listName to item 1 of argv
-          set theTitle to item 2 of argv
-          set theBody to item 3 of argv
-          tell application "Reminders"
-            set theList to first list whose name is listName
-            make new reminder at end of reminders of theList with properties {name:theTitle, body:theBody}
-          end tell
-        end run
-        '''
-        run_as(create_script, DAILY, title, r["body"])
-
-        # delete original from Backlog
-        delete_by_id(BACKLOG, r["id"])
-
-        # robust due time: next morning 8:00 AM
-        set_due_next_morning_8am(DAILY, title)
-
-        # init cadence state with today's weekday (anchor)
-        _get_or_init_record(title, anchor_weekday=datetime.now().weekday())
-
-        # fill notes if we have it in the local cache
-        ensure_notes_for(DAILY, title)
-
-        print(f"New verse moved from Backlog → Daily (next review at 8:00 AM): {title}")
-        return title
-
-    print("No eligible Backlog items to move (either empty or all were duplicates and cleaned).")
-    return None
-
-# ----- Cadence state helpers -----
-def _load_state() -> dict:
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"verses": {}}
-
-def _save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-def _get_or_init_record(title: str, *, anchor_weekday: Optional[int] = None) -> dict:
-    key = _norm_title(title)
-    state = _load_state()
-    rec = state["verses"].get(key)
-    if rec is None:
-        rec = {
-            "title": title.strip(),
-            "stage": "daily",       # daily | weekly | monthly
-            "daily_count": 0,
-            "weekly_count": 0,
-            "anchor_weekday": anchor_weekday if anchor_weekday is not None else datetime.now().weekday()
-        }
-        state["verses"][key] = rec
-        _save_state(state)
-    return rec
-
-def _update_record(title: str, **changes) -> None:
-    key = _norm_title(title)
-    state = _load_state()
-    rec = state["verses"].setdefault(key, {
-        "title": title.strip(),
-        "stage": "daily",
-        "daily_count": 0,
-        "weekly_count": 0,
-        "anchor_weekday": datetime.now().weekday()
-    })
-    rec.update(changes)
-    _save_state(state)
-
-# ----- Cadence date helpers -----
-def next_morning_8am(base: datetime) -> datetime:
-    return (base + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
-
-def next_same_weekday_8am(anchor_weekday: int, base: datetime) -> datetime:
-    days_ahead = (anchor_weekday - base.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    target = base + timedelta(days=days_ahead)
-    return target.replace(hour=8, minute=0, second=0, microsecond=0)
-
-# ----- Advance-on-complete (cadence-aware) -----
 def advance_on_complete():
     now = datetime.now()
 
@@ -511,7 +1031,7 @@ def advance_on_complete():
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
 
-        if rec.get("stage") != "weekly" and rec.get("stage") != "monthly":
+        if rec.get("stage") not in ("weekly", "monthly", "mastered"):
             dcount = int(rec.get("daily_count", 0))
             if dcount + 1 < DAILY_REPEATS:
                 due = next_morning_8am(now)
@@ -520,6 +1040,7 @@ def advance_on_complete():
                 _update_record(title, stage="daily", daily_count=dcount + 1, anchor_weekday=anchor)
                 print(f"[Daily] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')}; day {dcount+1}/{DAILY_REPEATS}")
             else:
+                # Move to Weekly
                 move_by_title(DAILY, WEEKLY, title)
                 wdue = next_same_weekday_8am(anchor, now)
                 set_due(WEEKLY, title, wdue)
@@ -543,11 +1064,12 @@ def advance_on_complete():
             _update_record(title, stage="weekly", weekly_count=wcount + 1, anchor_weekday=anchor)
             print(f"[Weekly] Rescheduled {title} for {wdue.strftime('%m/%d/%Y 08:00')}; week {wcount+1}/{WEEKLY_REPEATS}")
         else:
+            # Move to Monthly and init monthly_count
             move_by_title(WEEKLY, MONTHLY, title)
-            mdue = (now + timedelta(days=30)).replace(hour=8, minute=0, second=0, microsecond=0)
+            mdue = next_same_weekday_in_n_months_8am(anchor, now, 1)  # next month, same weekday, 8am
             set_due(MONTHLY, title, mdue)
             mark_incomplete_by_title(MONTHLY, title)
-            _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, anchor_weekday=anchor)
+            _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, monthly_count=0, anchor_weekday=anchor)
             print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y 08:00')}")
 
     # ===== Monthly stage =====
@@ -555,15 +1077,145 @@ def advance_on_complete():
         if not r["completed"]:
             continue
         title = r["name"]
-        mdue = (now + timedelta(days=30)).replace(hour=8, minute=0, second=0, microsecond=0)
-        set_due(MONTHLY, title, mdue)
-        mark_incomplete_by_title(MONTHLY, title)
-        _update_record(title, stage="monthly")
-        print(f"[Monthly] Rescheduled {title} for {mdue.strftime('%m/%d/%Y 08:00')}")
+        rec = _get_or_init_record(title)
+        anchor = rec.get("anchor_weekday", now.weekday())
+        mcount = int(rec.get("monthly_count", 0)) + 1  # count this completion
 
-# ----- Debug / utilities -----
+        if mcount >= MONTHLY_REPEATS:
+            # Graduate to Mastered
+            move_by_title(MONTHLY, MASTERED, title)
+            # First Mastered review after MASTERED_REVIEW_MONTHS[0] months (e.g., 3)
+            first_gap = MASTERED_REVIEW_MONTHS[0] if MASTERED_REVIEW_MONTHS else MASTERED_YEARLY_INTERVAL
+            due = next_same_weekday_in_n_months_8am(anchor, now, first_gap)
+            set_due(MASTERED, title, due)
+            mark_incomplete_by_title(MASTERED, title)
+            _update_record(title, stage="mastered", monthly_count=mcount, mastered_count=0, anchor_weekday=anchor)
+            print(f"[Monthly→Mastered] {title} graduated after {MONTHLY_REPEATS} monthly reviews; next check {due.strftime('%m/%d/%Y 08:00')}")
+        else:
+            # Stay Monthly: next month same weekday at 8am
+            due = next_same_weekday_in_n_months_8am(anchor, now, 1)
+            set_due(MONTHLY, title, due)
+            mark_incomplete_by_title(MONTHLY, title)
+            _update_record(title, stage="monthly", monthly_count=mcount, anchor_weekday=anchor)
+            print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')} ({mcount}/{MONTHLY_REPEATS})")
+
+    # ===== Mastered stage =====
+    for r in list_reminders(MASTERED):
+        if not r["completed"]:
+            continue
+        title = r["name"]
+        rec = _get_or_init_record(title)
+        anchor = rec.get("anchor_weekday", now.weekday())
+        k = int(rec.get("mastered_count", 0)) + 1  # increment mastered completions
+
+        # Determine next gap in months
+        if k < 1:
+            gap = MASTERED_REVIEW_MONTHS[0] if MASTERED_REVIEW_MONTHS else MASTERED_YEARLY_INTERVAL
+        elif k <= len(MASTERED_REVIEW_MONTHS):
+            gap = MASTERED_REVIEW_MONTHS[k - 1]  # 1→index 0 already used above; this line keeps simple progression
+        else:
+            gap = MASTERED_YEARLY_INTERVAL  # yearly thereafter
+
+        due = next_same_weekday_in_n_months_8am(anchor, now, gap)
+        set_due(MASTERED, title, due)
+        mark_incomplete_by_title(MASTERED, title)
+        _update_record(title, stage="mastered", mastered_count=k, anchor_weekday=anchor)
+        schedule_label = f"next in {gap} mo" if k <= len(MASTERED_REVIEW_MONTHS) else "next yearly"
+        print(f"[Mastered] Rescheduled {title} ({schedule_label}); completed {k} mastered review(s)")
+
+
+def _weekday_name(ix: int) -> str:
+    names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    try:
+        return names[int(ix) % 7]
+    except Exception:
+        return "?"
+
+def _find_item_across_lists(title: str):
+    """
+    Return (list_name, item_dict) for a title found in any list, else (None, None).
+    """
+    for ln in [DAILY, WEEKLY, MONTHLY, MASTERED, BACKLOG]:
+        items = list_reminders(ln)
+        for it in items:
+            if _norm_title(it["name"]) == _norm_title(title):
+                return (ln, it)
+    return (None, None)
+
+def print_status():
+    """
+    Show a snapshot of each tracked verse: stage, counters, anchor weekday,
+    where it lives now, completion flag, and next due (raw string from Reminders).
+    Also surfaces 'orphans' (in Reminders but not in state) and 'stale' (in state but not in Reminders).
+    """
+    state = _load_state()
+    recs = state.get("verses", {})
+
+    # Build reverse index of reminder titles (normalized) → (list_name, item)
+    all_items = []
+    for ln in [DAILY, WEEKLY, MONTHLY, MASTERED, BACKLOG]:
+        try:
+            for it in list_reminders(ln):
+                all_items.append((ln, it))
+        except Exception:
+            pass
+    idx = {_norm_title(it["name"]): (ln, it) for (ln, it) in all_items}
+
+    print("\n=== STATUS ===============================================")
+    print("Title                                 | Stage     | D/W/M/M* | Anchor | List       | Completed | Due")
+    print("----------------------------------------------------------+-----------+------------+--------+------------+-----------+------------------------------")
+
+    def fmt_counts(rec: dict) -> str:
+        d = int(rec.get("daily_count", 0))
+        w = int(rec.get("weekly_count", 0))
+        m = int(rec.get("monthly_count", 0))
+        k = int(rec.get("mastered_count", 0))
+        return f"D:{d}/{DAILY_REPEATS}-W:{w}/{WEEKLY_REPEATS}-M:{m}/{MONTHLY_REPEATS}-M*:{k}"
+
+    # Tracked in state
+    tracked_keys = set()
+    for key, rec in sorted(recs.items(), key=lambda kv: kv[1].get("title","")):
+        title = rec.get("title") or ""
+        tracked_keys.add(_norm_title(title))
+        stage = (rec.get("stage") or "?").ljust(9)
+        counts = fmt_counts(rec).ljust(10)
+        anchor = _weekday_name(rec.get("anchor_weekday", 0)).ljust(6)
+
+        ln, it = idx.get(_norm_title(title), (None, None))
+        list_name   = (ln or "-").ljust(10)
+        completed   = ("True" if (it and it.get("completed")) else "False").ljust(9)
+        due_display = (it.get("due") if it else "(missing)").strip() if it else "(missing)"
+
+        # Trim/pad title for neat columns
+        tcol = (title[:35] + "…") if len(title) > 36 else title.ljust(36)
+        print(f"{tcol} | {stage} | {counts} | {anchor} | {list_name} | {completed} | {due_display}")
+
+    # Orphans: in Reminders but not tracked in state
+    orphan_titles = []
+    for (ln, it) in all_items:
+        if _norm_title(it["name"]) not in tracked_keys:
+            orphan_titles.append((ln, it))
+
+    if orphan_titles:
+        print("\nOrphans (exist in Reminders but not in state):")
+        for (ln, it) in orphan_titles:
+            print(f"  - [{ln}] {it['name']} | completed={it['completed']} | due={it['due']!r}")
+
+    # Stale: in state but not found in any Reminders list
+    stale = [recs[k]["title"] for k in recs.keys() if k not in idx]
+    if stale:
+        print("\nStale (tracked in state but missing from Reminders):")
+        for t in stale:
+            print(f"  - {t}")
+
+    print("===========================================================\n")
+
+
+# ====================================================================
+# Debug / utilities
+# ====================================================================
 def debug_dump():
-    for ln in [DAILY, WEEKLY, MONTHLY, BACKLOG]:
+    for ln in [DAILY, WEEKLY, MONTHLY, BACKLOG, MASTERED]:
         items = list_reminders(ln)
         print(f"\n== {ln} ==")
         for it in items:
@@ -577,20 +1229,183 @@ def dump_state():
         print("\n[STATE] (no state file yet)")
 
 def fill_notes_for_daily():
-    """Try to fill notes for any Daily reminders with blank notes (from local cache)."""
+    """Try to fill notes for any Daily reminders with blank notes (API)."""
     filled = 0
     for it in list_reminders(DAILY):
-        if not it["body"].strip():
+        if not (it["body"] or "").strip():
             if ensure_notes_for(DAILY, it["name"]):
                 filled += 1
     print(f"Filled notes for {filled} item(s) in Daily.")
 
-# ----- Tiny CLI -----
+def cli_test_fetch(ref: str) -> None:
+    txt = fetch_scripture_text(ref)
+    if not txt:
+        print("(no text returned)")
+        return
+    preview = [line for line in txt.splitlines() if line.strip()]
+    print("\n".join(preview[:6]))
+    if len(preview) > 6:
+        print("... (truncated)")
+
+
+def existing_refs_across_all_lists() -> list[str]:
+    """Raw titles from Daily/Weekly/Monthly/Backlog."""
+    titles = []
+    for ln in [DAILY, WEEKLY, MONTHLY, BACKLOG]:
+        try:
+            titles += [x["name"] for x in list_reminders(ln)]
+        except Exception:
+            pass
+    # Dedup while preserving order
+    seen = set()
+    out = []
+    for t in titles:
+        k = _norm_title(t)
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out
+
+
+def ensure_list_exists(list_name: str) -> bool:
+    script = r'''
+    on run argv
+      set listName to item 1 of argv
+      tell application "Reminders"
+        if not (exists (list listName)) then
+          make new list with properties {name:listName}
+        end if
+      end tell
+      return "OK"
+    end run
+    '''
+    try:
+        return run_as(script, list_name) == "OK"
+    except Exception:
+        return False
+
+def ensure_all_lists() -> None:
+    for ln in [BACKLOG, DAILY, WEEKLY, MONTHLY, MASTERED]:
+        ok = ensure_list_exists(ln)
+        print(f"[setup] {( 'OK ' if ok else 'ERR')}  {ln}")
+
+
+def doctor():
+    print("\n=== scripture_agent doctor ===")
+
+    # 1) Config + lists
+    try:
+        cfg = load_or_init_config()
+        apply_config(cfg)
+        print("[config] loaded config")
+    except Exception as e:
+        print(f"[config] ERROR: {e}")
+
+    print("[lists] ensuring all lists exist…")
+    ensure_all_lists()
+
+    # 2) nephi.org reachability
+    probe_ref = "1 Nephi 1:1"
+    print(f"[nephi] test-fetch '{probe_ref}' …")
+    txt = fetch_scripture_text(probe_ref)
+    if txt:
+        snippet = " ".join([ln.strip() for ln in txt.splitlines() if ln.strip()][:2])
+        print(f"[nephi] OK  (preview: {snippet[:120]}{'…' if len(snippet)>120 else ''})")
+    else:
+        print("[nephi] WARN  could not retrieve sample passage; check network or API availability")
+
+    # 3) OpenAI key presence (no call here to save tokens)
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if key:
+        print("[openai] OK  OPENAI_API_KEY present")
+    else:
+        print("[openai] WARN  OPENAI_API_KEY not set (ChatGPT fallback won’t run)")
+
+    # 4) basic state access
+    st = _load_state()
+    if isinstance(st, dict) and "verses" in st:
+        print(f"[state] OK  {len(st.get('verses', {}))} tracked verse(s)")
+    else:
+        print("[state] WARN  could not read state file")
+
+    print("=== doctor done ===\n")
+
+
+def run_daily(topic_arg: Optional[str] = None):
+    """
+    One 'daily' run:
+      1) advance_on_complete()
+      2) fill_notes_for_daily()
+      3) maybe_add_new_verse_from_backlog()  (uses topic_arg or config auto_add.topic_default)
+    Writes a short summary to ~/.scripture_agent/agent.log
+    """
+    cfg = load_or_init_config()  # ensure config loaded
+    apply_config(cfg)
+
+    # Pick topic: CLI beats config; empty string means "no topic"
+    cfg_topic = (cfg.get("auto_add", {}) or {}).get("topic_default", "") or None
+    topic = topic_arg if (topic_arg and topic_arg.strip()) else cfg_topic
+
+    _append_log("run-daily: start")
+
+    try:
+        advance_on_complete()
+        _append_log("run-daily: advance_on_complete OK")
+    except Exception as e:
+        _append_log(f"run-daily: advance_on_complete ERROR: {e}")
+
+    try:
+        fill_notes_for_daily()
+        _append_log("run-daily: fill_notes_for_daily OK")
+    except Exception as e:
+        _append_log(f"run-daily: fill_notes_for_daily ERROR: {e}")
+
+    try:
+        moved_or_added = maybe_add_new_verse_from_backlog(topic=topic)
+        if moved_or_added:
+            _append_log(f"run-daily: new verse added/moved → {moved_or_added}")
+        else:
+            _append_log("run-daily: no new verse added/moved")
+    except Exception as e:
+        _append_log(f"run-daily: maybe_add_new_verse_from_backlog ERROR: {e}")
+
+    _append_log("run-daily: done")
+
+
+import csv
+
+CSV_PATH = os.path.join(CONFIG_DIR, "progress.csv")
+
+def _append_csv_event(title: str, stage: str, action: str, next_due: str = "") -> None:
+    """
+    Append a row to ~/.scripture_agent/progress.csv
+    Fields: timestamp, title, stage, action, next_due
+    """
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        newfile = not os.path.exists(CSV_PATH)
+        with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if newfile:
+                w.writerow(["timestamp", "title", "stage", "action", "next_due"])
+            w.writerow([ts, title, stage, action, next_due])
+    except Exception as e:
+        _append_log(f"[csv] ERROR {e}")
+
+
+# ====================================================================
+# Tiny CLI
+# ====================================================================
 def main():
+    cfg = load_or_init_config()
+    apply_config(cfg)
+
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if cmd == "new-verse":
-        maybe_add_new_verse_from_backlog()
+        topic = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else None
+        maybe_add_new_verse_from_backlog(topic=topic if topic else None)
         debug_dump()
 
     elif cmd == "advance":
@@ -604,12 +1419,51 @@ def main():
     elif cmd == "state":
         dump_state()
 
+    elif cmd == "test-fetch":
+        ref = " ".join(sys.argv[2:]).strip()
+        if not ref:
+            print('Usage: python scripture_agent.py test-fetch "Book Chapter:Verse[-Verse]"')
+        else:
+            cli_test_fetch(ref)
+
     elif cmd == "help":
         print("Usage:")
-        print("  python scripture_agent.py new-verse   # Backlog → Daily (dedupe, due 8am, init state, fill notes if cached)")
-        print("  python scripture_agent.py advance     # Reschedule/move after you mark complete")
-        print("  python scripture_agent.py fill-notes  # Fill notes from local cache (Daily)")
-        print("  python scripture_agent.py state       # Show cadence state file")
+        print("  python scripture_agent.py new-verse    # Backlog → Daily (dedupe, due 8am, init state, fill notes via API)")
+        print("  python scripture_agent.py advance      # Reschedule/move after you mark complete")
+        print("  python scripture_agent.py fill-notes   # Fill notes for Daily from API")
+        print('  python scripture_agent.py test-fetch "Mosiah 2:21-22"')
+        print("  python scripture_agent.py state        # Show cadence state file")
+        print('  python scripture_agent.py new-verse [topic]   # Pull from Backlog or (if empty & allowed) ask ChatGPT, e.g. "new-verse grace"')
+        print("  python scripture_agent.py config        # Show merged config currently in use")
+        print("  python scripture_agent.py status       # Show stages, counts, and next due for all verses")
+        print("  python scripture_agent.py setup        # Create any missing lists from config")
+        print("  python scripture_agent.py doctor       # Check lists, config, APIs, env")
+        print('  python scripture_agent.py run-daily [topic]  # Advance, fill notes, then add new verse if needed')
+
+
+    elif cmd == "config":
+        cfg = load_or_init_config()
+        apply_config(cfg)
+        print(json.dumps(cfg, indent=2))
+
+    elif cmd == "status":
+        print_status()
+
+    elif cmd == "setup":
+        ensure_all_lists()
+
+    elif cmd == "doctor":
+        doctor()
+
+    elif cmd == "run-daily":
+        # Optional topic after the command, e.g.:
+        #   python scripture_agent.py run-daily grace
+        topic = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else None
+        run_daily(topic_arg=topic)
+
+
+
+
     else:
         print(f"Unknown command: {cmd} (run 'help')")
 
