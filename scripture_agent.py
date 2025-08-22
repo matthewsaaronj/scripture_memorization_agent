@@ -759,11 +759,13 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
        - Set due to next morning 08:00
        - Init cadence state with today's weekday (anchor)
        - Fill notes via API if blank
+       - CSV log "moved-from-backlog"
     4) If Backlog is empty and frequency gate allows:
        - Ask ChatGPT once for a contiguous reference (optionally guided by `topic`)
        - Pass an exclusions list to avoid duplicates/overlaps
        - If it still overlaps, skip (no further model calls)
        - Create in Daily, set due 8:00, init state, fill notes
+       - CSV log "chatgpt-added"
     Returns the moved/created title, or None if nothing done.
     """
     now = datetime.now()
@@ -787,7 +789,6 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
     for r in backlog_items:
         title = r["name"].strip()
         overlapping = ref_overlaps_anywhere(title)
-        # If it overlaps *and* isn't the exact same normalized string, remove it
         if overlapping and _norm_title(title) != _norm_title(overlapping):
             delete_by_id(BACKLOG, r["id"])
             print(f"Cleaned overlapping Backlog item: {title} (overlaps {overlapping})")
@@ -818,6 +819,10 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
         _get_or_init_record(title, anchor_weekday=now.weekday())
         ensure_notes_for(DAILY, title)
 
+        # CSV log
+        next_due = next_morning_8am(now).strftime('%Y-%m-%d 08:00')
+        _append_csv_event(title, "daily", "moved-from-backlog", next_due)
+
         print(f"New verse moved from Backlog → Daily (next review at 8:00 AM): {title}")
         return title
 
@@ -826,14 +831,12 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
         print("[new-verse] Backlog empty, but frequency gate prevents auto-add today.")
         return None
 
-    # One call with explicit exclusions to avoid overlaps/duplicates
     exclusions = existing_refs_across_all_lists()
     candidate = suggest_reference_via_chatgpt(topic=topic, exclusions=exclusions)
     if not candidate:
         print("[new-verse] ChatGPT did not provide a usable reference.")
         return None
 
-    # Hard guard: if it still overlaps, stop (no extra API calls)
     overlapping = ref_overlaps_anywhere(candidate)
     if overlapping:
         print(f"[new-verse] ChatGPT suggested '{candidate}', but it overlaps existing '{overlapping}'. "
@@ -855,12 +858,15 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
 
     set_due_next_morning_8am(DAILY, candidate)
     _get_or_init_record(candidate, anchor_weekday=now.weekday())
-    ensure_notes_for(DAILY, candidate)  # fetch exact text via API
+    ensure_notes_for(DAILY, candidate)
     _set_last_auto_added_date(now)
+
+    # CSV log
+    next_due = next_morning_8am(now).strftime('%Y-%m-%d 08:00')
+    _append_csv_event(candidate, "daily", "chatgpt-added", next_due)
 
     print(f"[ChatGPT] Added new verse to Daily (next review at 8:00 AM): {candidate}")
     return candidate
-
 
 
 # ====================================================================
@@ -1039,6 +1045,7 @@ def advance_on_complete():
                 mark_incomplete_by_title(DAILY, title)
                 _update_record(title, stage="daily", daily_count=dcount + 1, anchor_weekday=anchor)
                 print(f"[Daily] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')}; day {dcount+1}/{DAILY_REPEATS}")
+                _append_csv_event(title, "daily", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
             else:
                 # Move to Weekly
                 move_by_title(DAILY, WEEKLY, title)
@@ -1047,6 +1054,7 @@ def advance_on_complete():
                 mark_incomplete_by_title(WEEKLY, title)
                 _update_record(title, stage="weekly", daily_count=DAILY_REPEATS, weekly_count=0, anchor_weekday=anchor)
                 print(f"[Daily→Weekly] {title} scheduled {wdue.strftime('%m/%d/%Y 08:00')}")
+                _append_csv_event(title, "weekly", "promoted", wdue.strftime('%Y-%m-%d 08:00'))
 
     # ===== Weekly stage =====
     for r in list_reminders(WEEKLY):
@@ -1063,14 +1071,16 @@ def advance_on_complete():
             mark_incomplete_by_title(WEEKLY, title)
             _update_record(title, stage="weekly", weekly_count=wcount + 1, anchor_weekday=anchor)
             print(f"[Weekly] Rescheduled {title} for {wdue.strftime('%m/%d/%Y 08:00')}; week {wcount+1}/{WEEKLY_REPEATS}")
+            _append_csv_event(title, "weekly", "rescheduled", wdue.strftime('%Y-%m-%d 08:00'))
         else:
             # Move to Monthly and init monthly_count
             move_by_title(WEEKLY, MONTHLY, title)
-            mdue = next_same_weekday_in_n_months_8am(anchor, now, 1)  # next month, same weekday, 8am
+            mdue = next_same_weekday_in_n_months_8am(anchor, now, 1)
             set_due(MONTHLY, title, mdue)
             mark_incomplete_by_title(MONTHLY, title)
             _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, monthly_count=0, anchor_weekday=anchor)
             print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y 08:00')}")
+            _append_csv_event(title, "monthly", "promoted", mdue.strftime('%Y-%m-%d 08:00'))
 
     # ===== Monthly stage =====
     for r in list_reminders(MONTHLY):
@@ -1084,20 +1094,21 @@ def advance_on_complete():
         if mcount >= MONTHLY_REPEATS:
             # Graduate to Mastered
             move_by_title(MONTHLY, MASTERED, title)
-            # First Mastered review after MASTERED_REVIEW_MONTHS[0] months (e.g., 3)
             first_gap = MASTERED_REVIEW_MONTHS[0] if MASTERED_REVIEW_MONTHS else MASTERED_YEARLY_INTERVAL
             due = next_same_weekday_in_n_months_8am(anchor, now, first_gap)
             set_due(MASTERED, title, due)
             mark_incomplete_by_title(MASTERED, title)
             _update_record(title, stage="mastered", monthly_count=mcount, mastered_count=0, anchor_weekday=anchor)
             print(f"[Monthly→Mastered] {title} graduated after {MONTHLY_REPEATS} monthly reviews; next check {due.strftime('%m/%d/%Y 08:00')}")
+            _append_csv_event(title, "mastered", "promoted", due.strftime('%Y-%m-%d 08:00'))
         else:
-            # Stay Monthly: next month same weekday at 8am
+            # Stay Monthly
             due = next_same_weekday_in_n_months_8am(anchor, now, 1)
             set_due(MONTHLY, title, due)
             mark_incomplete_by_title(MONTHLY, title)
             _update_record(title, stage="monthly", monthly_count=mcount, anchor_weekday=anchor)
             print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')} ({mcount}/{MONTHLY_REPEATS})")
+            _append_csv_event(title, "monthly", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
 
     # ===== Mastered stage =====
     for r in list_reminders(MASTERED):
@@ -1108,13 +1119,12 @@ def advance_on_complete():
         anchor = rec.get("anchor_weekday", now.weekday())
         k = int(rec.get("mastered_count", 0)) + 1  # increment mastered completions
 
-        # Determine next gap in months
         if k < 1:
             gap = MASTERED_REVIEW_MONTHS[0] if MASTERED_REVIEW_MONTHS else MASTERED_YEARLY_INTERVAL
         elif k <= len(MASTERED_REVIEW_MONTHS):
-            gap = MASTERED_REVIEW_MONTHS[k - 1]  # 1→index 0 already used above; this line keeps simple progression
+            gap = MASTERED_REVIEW_MONTHS[k - 1]
         else:
-            gap = MASTERED_YEARLY_INTERVAL  # yearly thereafter
+            gap = MASTERED_YEARLY_INTERVAL
 
         due = next_same_weekday_in_n_months_8am(anchor, now, gap)
         set_due(MASTERED, title, due)
@@ -1122,6 +1132,7 @@ def advance_on_complete():
         _update_record(title, stage="mastered", mastered_count=k, anchor_weekday=anchor)
         schedule_label = f"next in {gap} mo" if k <= len(MASTERED_REVIEW_MONTHS) else "next yearly"
         print(f"[Mastered] Rescheduled {title} ({schedule_label}); completed {k} mastered review(s)")
+        _append_csv_event(title, "mastered", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
 
 
 def _weekday_name(ix: int) -> str:
@@ -1404,9 +1415,15 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
 
     if cmd == "new-verse":
-        topic = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else None
-        maybe_add_new_verse_from_backlog(topic=topic if topic else None)
+        # Use CLI topic if provided; otherwise fall back to config's topic_default
+        cfg = load_or_init_config()
+        apply_config(cfg)
+        cfg_topic = (cfg.get("auto_add", {}) or {}).get("topic_default", "") or None
+        cli_topic = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else None
+        topic = cli_topic if (cli_topic and cli_topic.strip()) else cfg_topic
+        maybe_add_new_verse_from_backlog(topic=topic)
         debug_dump()
+
 
     elif cmd == "advance":
         advance_on_complete()
