@@ -22,6 +22,9 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import subprocess
 import random
+import uuid
+import hashlib
+
 
 # ----- List names (top-level, no groups) -----
 BACKLOG  = "Scripture Memorization - Backlog"
@@ -771,6 +774,28 @@ def ensure_notes_for(list_name: str, title: str) -> bool:
 
     return set_body_by_id(list_name, m["id"], text.strip())
 
+_SID_RE = re.compile(r"\[sid:([0-9a-fA-F-]{36})\]\s*$")
+
+def _new_sid() -> str:
+    return str(uuid.uuid4())
+
+def _extract_sid(note: str) -> Optional[str]:
+    """
+    Extract the SID from a note body.
+    Looks for the pattern [sid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx]
+    anywhere in the text (even far down).
+    """
+    if not note:
+        return None
+
+    match = re.search(r"\[sid:([0-9a-fA-F-]{36})\]", note)
+    return match.group(1) if match else None
+
+def _append_sid(note: str, sid: str) -> str:
+    note = (note or "").rstrip()
+    return f"{note}\n\n[sid:{sid}]\n"
+
+
 # ====================================================================
 # Backlog → Daily (clean duplicates, move one, set due 8am, init state, fill notes)
 # ====================================================================
@@ -846,6 +871,8 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
         set_due_next_morning_8am(DAILY, title)
         _get_or_init_record(title, anchor_weekday=now.weekday())
         ensure_notes_for(DAILY, title)
+        _ensure_sid_for_title(DAILY, title)
+
 
         # CSV log
         next_due = next_morning_8am(now).strftime('%Y-%m-%d 08:00')
@@ -887,6 +914,8 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
     set_due_next_morning_8am(DAILY, candidate)
     _get_or_init_record(candidate, anchor_weekday=now.weekday())
     ensure_notes_for(DAILY, candidate)
+    _ensure_sid_for_title(DAILY, candidate)
+
     _set_last_auto_added_date(now)
 
     # CSV log
@@ -925,7 +954,11 @@ def _get_or_init_record(title: str, *, anchor_weekday: Optional[int] = None) -> 
             "monthly_count": 0,
             "mastered_count": 0,
             "anchor_weekday": anchor_weekday if anchor_weekday is not None else datetime.now().weekday(),
+            "sid": None,            # <-- new: UUID for deterministic matching
+            "full_text": "",        # reserved for upcoming canonical text
+            "full_text_sha": ""     # reserved (checksum)
         }
+
         state["verses"][key] = rec
         _save_state(state)
     return rec
@@ -1107,6 +1140,7 @@ def advance_on_complete():
             set_due(MONTHLY, title, mdue)
             mark_incomplete_by_title(MONTHLY, title)
             _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, monthly_count=0, anchor_weekday=anchor)
+            _ensure_canonical_monthly_note(title, now)
             if OBF_ENABLED:
                 _refresh_monthly_obfuscation(title, now)
             print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y 08:00')}")
@@ -1137,6 +1171,7 @@ def advance_on_complete():
             set_due(MONTHLY, title, due)
             mark_incomplete_by_title(MONTHLY, title)
             _update_record(title, stage="monthly", monthly_count=mcount, anchor_weekday=anchor)
+            _ensure_canonical_monthly_note(title, now)
             if OBF_ENABLED:
                 _refresh_monthly_obfuscation(title, now)
             print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')} ({mcount}/{MONTHLY_REPEATS})")
@@ -1279,6 +1314,41 @@ def fill_notes_for_daily():
             if ensure_notes_for(DAILY, it["name"]):
                 filled += 1
     print(f"Filled notes for {filled} item(s) in Daily.")
+
+def fill_notes_for_weekly():
+    """Fill notes for Weekly if blank, then attach SID and cache full_text in state."""
+    filled = 0
+    for it in list_reminders(WEEKLY):
+        try:
+            if not (it["body"] or "").strip():
+                if ensure_notes_for(WEEKLY, it["name"]):
+                    filled += 1
+                    # ensure SID and cache full_text from the newly-added note
+                    _ensure_sid_for_title(WEEKLY, it["name"])
+                    _ingest_full_text_from_note(WEEKLY, it["id"], it["name"])
+        except Exception as e:
+            print(f"[weekly] fill-notes error for '{it.get('name','?')}': {e}")
+    print(f"Filled notes for {filled} item(s) in Weekly.")
+
+
+def fill_notes_for_monthly():
+    """Fill notes for Monthly if blank, then attach SID, cache full_text, and canonicalize with obfuscation."""
+    filled = 0
+    now = datetime.now()
+    for it in list_reminders(MONTHLY):
+        try:
+            if not (it["body"] or "").strip():
+                if ensure_notes_for(MONTHLY, it["name"]):
+                    filled += 1
+                    # ensure SID and cache full_text from the freshly-filled note
+                    _ensure_sid_for_title(MONTHLY, it["name"])
+                    _ingest_full_text_from_note(MONTHLY, it["id"], it["name"])
+                    # immediately rebuild into canonical obfuscated layout
+                    _ensure_canonical_monthly_note(it["name"], now)
+        except Exception as e:
+            print(f"[monthly] fill-notes error for '{it.get('name','?')}': {e}")
+    print(f"Filled notes for {filled} item(s) in Monthly.")
+
 
 def cli_test_fetch(ref: str) -> None:
     txt = fetch_scripture_text(ref)
@@ -1490,16 +1560,38 @@ def obfuscate_word(w: str) -> str:
 
     return _WORD_RE.sub(repl, full_text)
 
-def _note_with_obfuscation(full_text: str, ratio: float, seed: int) -> str:
-    obf = _obfuscate_text(full_text, ratio, seed) if ratio < 1.0 else full_text
-    # Build dot buffer: blank line, ".", blank line, ".", ...
-    buf_lines = []
-    for _ in range(max(0, OBF_BUFFER_LINES)):
-        buf_lines.append("")                 # blank line
-        buf_lines.append(OBF_BUFFER_TOKEN)   # "."
-    buffer_block = ("\n".join(buf_lines) + "\n") if buf_lines else ""
-    # Canonical layout: obfuscated block, blank line, buffer, separator, full text
-    return f"{obf.strip()}\n\n{buffer_block}{OBF_SEPARATOR}{full_text.strip()}"
+def _note_with_obfuscation(full_text: str, visible_ratio: float, seed: int, sid: Optional[str] = None) -> str:
+    """
+    Canonical note format:
+      [OBFUSCATED TEXT]
+      [dot buffer lines]
+      ______________________________
+      [FULL ORIGINAL TEXT]
+      [blank spacer]
+      [sid:...]
+    """
+    obf = _obfuscate_text(full_text, visible_ratio, seed)
+    buf_lines = int(globals().get("OBF_BUFFER_LINES", 4))
+    buf_token = str(globals().get("OBF_BUFFER_TOKEN", "."))
+    sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
+
+    buffer_block = "\n".join(buf_token for _ in range(buf_lines)) if buf_lines > 0 else ""
+
+    parts = []
+    parts.append(obf.strip())
+    if buffer_block:
+        parts.append(buffer_block)
+    parts.append(sep + full_text.strip())
+
+    body = "\n\n".join(parts)
+
+    if sid:
+        body = f"{body}\n\n\n[sid:{sid}]"
+
+    return body
+
+
+
 
 
 def _weekly_seed_for(title: str, now: datetime) -> int:
@@ -1565,6 +1657,234 @@ def _refresh_monthly_obfuscation(title: str, now: datetime) -> None:
         _append_log(f"[obfuscate] ERROR for '{title}': {e}")
 
 
+# ====================================================================
+# SID helpers
+# ====================================================================
+def _ensure_sid_for_title(list_name: str, title: str) -> Optional[str]:
+    """
+    Ensure the reminder in list_name with the given title has a [sid:UUID] footer,
+    preserving original newline formatting in the note body.
+    """
+    # Locate item by normalized title
+    items = list_reminders(list_name)
+    it = next((x for x in items if _norm_title(x["name"]) == _norm_title(title)), None)
+    if not it:
+        return None
+
+    # IMPORTANT: fetch RAW body (list_reminders flattens newlines)
+    note_raw = get_body_by_id_raw(list_name, it["id"])
+    sid = _extract_sid(note_raw)
+    if not sid:
+        sid = _new_sid()
+        new_body = _append_sid(note_raw, sid)
+        set_body_by_id(list_name, it["id"], new_body)
+
+    # Mirror into state
+    rec = _get_or_init_record(title)
+    if rec.get("sid") != sid:
+        _update_record(title, sid=sid)
+
+    return sid
+
+
+def _append_sid(note: str, sid: str) -> str:
+    """
+    Append the SID far down in the note body with blank spacer lines,
+    without disturbing existing verse formatting.
+    """
+    base = (note or "").rstrip()
+
+    # Push the SID down so it's not casually visible
+    spacer = "\n" * 8  
+
+    return f"{base}{spacer}[sid:{sid}]"
+
+def get_body_by_id_raw(list_name: str, rem_id: str) -> str:
+    script = r'''
+    on run argv
+      set listName to item 1 of argv
+      set rid to item 2 of argv
+      tell application "Reminders"
+        set theList to first list whose name is listName
+        try
+          set r to first reminder of theList whose id is rid
+          if body of r is missing value then
+            return ""
+          else
+            return (body of r as text)
+          end if
+        on error
+          return ""
+        end try
+      end tell
+    end run
+    '''
+    try:
+        return run_as(script, list_name, rem_id)
+    except Exception:
+        return ""
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+def _extract_full_text(note: str) -> str:
+    sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
+    note = (note or "")
+    parts = note.rsplit(sep, 1)
+    return parts[1].strip() if len(parts) == 2 else note.strip()
+
+def _ratio_for_monthly_count(mcount: int) -> float:
+    schedule = globals().get("OBF_SCHEDULE", [1.0, 0.75, 0.5, 0.35, 0.2])
+    repeats = int(globals().get("MONTHLY_REPEATS", 24))
+    if not schedule:
+        return 1.0
+    if len(schedule) == 1:
+        return float(schedule[0])
+    denom = max(1, repeats - 1)
+    p = max(0.0, min(1.0, float(mcount) / float(denom)))
+    steps = len(schedule) - 1
+    x = p * steps
+    i = int(x)
+    if i >= steps:
+        return float(schedule[-1])
+    frac = x - i
+    a = float(schedule[i]); b = float(schedule[i + 1])
+    return a * (1.0 - frac) + b * frac  # linear fade from start→end of schedule
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z’']*")
+
+def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
+    """Blank out ~ (1-visible_ratio) of eligible words using full-word underscores; preserve punctuation and spacing."""
+    if visible_ratio >= 0.999:
+        return full_text
+    min_len = int(globals().get("OBF_MIN_LEN", 3))
+    keep_first_last = bool(globals().get("OBF_KEEP_FL", False))
+
+    # Find eligible word spans
+    spans = []
+    for m in _WORD_RE.finditer(full_text):
+        w = m.group(0)
+        letters = sum(1 for c in w if c.isalpha())
+        if letters >= min_len:
+            spans.append((m.start(), m.end(), w))
+
+    if not spans:
+        return full_text
+
+    # How many to blank?
+    blank_frac = max(0.0, min(1.0, 1.0 - float(visible_ratio)))
+    k = int(round(blank_frac * len(spans)))
+    if k <= 0:
+        return full_text
+
+    rnd = random.Random(seed)
+    to_blank_idx = set(rnd.sample(range(len(spans)), k))
+
+    # Build result
+    out = []
+    last = 0
+    for idx, (s, e, w) in enumerate(spans):
+        out.append(full_text[last:s])
+        if idx in to_blank_idx:
+            if keep_first_last and len(w) >= 2:
+                core = "".join("_" if c.isalpha() else c for c in w[1:-1])
+                masked = w[0] + core + w[-1]
+            else:
+                masked = "".join("_" if c.isalpha() else c for c in w)
+            out.append(masked)
+        else:
+            out.append(w)
+        last = e
+    out.append(full_text[last:])
+    return "".join(out)
+
+def _note_with_obfuscation(full_text: str, visible_ratio: float, seed: int) -> str:
+    """Canonical note: [OBFUSCATED] + blank line + dot buffer + SEPARATOR + full text (no SID here)."""
+    obf = _obfuscate_text(full_text, visible_ratio, seed)
+    buf_lines = int(globals().get("OBF_BUFFER_LINES", 4))
+    buf_token = str(globals().get("OBF_BUFFER_TOKEN", "."))
+    sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
+
+    buffer_block = ""
+    if buf_lines > 0:
+        parts = []
+        for _ in range(buf_lines):
+            parts.append("")          # blank line
+            parts.append(buf_token)   # dot line
+        buffer_block = "\n".join(parts) + "\n"
+
+    return f"{obf.strip()}\n\n{buffer_block}{sep}{full_text.strip()}"
+
+def _resolve_full_text_for(title: str, list_name: str, rem_id: str) -> Optional[str]:
+    """Prefer state.full_text; else parse bottom of note; else fetch via API; then persist into state."""
+    rec = _get_or_init_record(title)
+    ft = (rec.get("full_text") or "").strip()
+    if ft:
+        return ft
+
+    # Read raw note to try extracting full text
+    try:
+        note_raw = get_body_by_id_raw(list_name, rem_id)
+    except Exception:
+        note_raw = ""
+    ft = _extract_full_text(note_raw).strip()
+    if not ft:
+        # Fetch from API
+        ft = fetch_scripture_text(title) or ""
+    if not ft:
+        return None
+
+    _update_record(title, full_text=ft, full_text_sha=_sha1(ft))
+    return ft
+
+def _monthly_seed(title: str, rec: dict) -> int:
+    """Deterministic seed that changes as monthly_count increments."""
+    sid = rec.get("sid") or title
+    mcount = int(rec.get("monthly_count", 0))
+    h = hashlib.sha1(f"{sid}|m|{mcount}".encode("utf-8")).hexdigest()[:8]
+    return int(h, 16)
+
+def _ensure_canonical_monthly_note(title: str, now: datetime) -> bool:
+    """
+    If item is in Monthly, rebuild the note canonically from state.full_text:
+      [obfuscated] + dot buffer + SEPARATOR + [full text] + blank space + [sid:...]
+    """
+    ln, it = _find_item_across_lists(title)
+    if ln != MONTHLY or not it:
+        return False
+
+    # Resolve canonical full text (prefer state; else from note; else API)
+    full = _resolve_full_text_for(title, ln, it["id"])
+    if not full:
+        return False
+
+    # Ratio & seed for this monthly count
+    rec = _get_or_init_record(title)
+    ratio = _ratio_for_monthly_count(int(rec.get("monthly_count", 0)))
+    seed = _monthly_seed(title, rec)
+
+    # Ensure we have/keep a SID
+    note_raw = get_body_by_id_raw(ln, it["id"])
+    sid = _extract_sid(note_raw) or rec.get("sid") or _ensure_sid_for_title(ln, title)
+
+    # Build canonical body and write
+    final_body = _note_with_obfuscation(full, ratio, seed, sid=sid)
+    return set_body_by_id(ln, it["id"], final_body)
+
+
+def _ingest_full_text_from_note(list_name: str, rem_id: str, title: str) -> None:
+    """
+    Read the note body (raw), extract the full scripture text, and cache it in state.
+    Safe no-op if we can't find text.
+    """
+    try:
+        note_raw = get_body_by_id_raw(list_name, rem_id)
+    except Exception:
+        note_raw = ""
+    full = _extract_full_text(note_raw).strip()
+    if full:
+        _update_record(title, full_text=full, full_text_sha=_sha1(full))
+
 
 # ====================================================================
 # Tiny CLI
@@ -1592,6 +1912,8 @@ def main():
 
     elif cmd == "fill-notes":
         fill_notes_for_daily()
+        fill_notes_for_weekly()
+        fill_notes_for_monthly()
         debug_dump()
 
     elif cmd == "state":
