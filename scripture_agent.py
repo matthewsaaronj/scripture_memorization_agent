@@ -1553,20 +1553,25 @@ def _extract_full_text(note: str) -> str:
     """
     Extract canonical FULL ORIGINAL TEXT from a note:
       - Take content AFTER the LAST obfuscation separator.
-      - If that tail still contains separators (from past duplication), take only the content after the last one.
-      - Strip ANY [sid:UUID] tokens that might have been embedded.
-      - Trim leading/trailing dot-buffer and blank lines.
-    If no separator exists, return entire note minus any [sid:...] tokens and spacer lines.
+      - If that tail still contains extra separators (legacy dupes), keep only after the last.
+      - Strip ANY bracketed UUID tokens like "[sid:...]" (even multiple copies).
+      - Trim leading dot-buffer/blank lines and trailing blank lines.
+    If no separator exists, return full note minus UUID tokens/extra spacer lines.
     """
     sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
     buf_token = str(globals().get("OBF_BUFFER_TOKEN", "."))
     s = (note or "")
 
-    # Remove trailing SID footer if present
-    s = re.sub(r"\s*\[sid:[0-9a-fA-F-]{36}\]\s*\Z", "", s.strip(), flags=re.MULTILINE)
+    # Remove any bracketed UUID tags anywhere (e.g., [sid:...])
+    rm_uuid_tags = lambda text: re.sub(
+        r"\[[^\[\]\n\r:]{1,16}:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\]",
+        "",
+        text,
+    )
 
-    # Isolate "full text" region: take tail after the final separator;
-    # if multiple separators exist in that tail (due to prior duplication), keep only after the last.
+    s = rm_uuid_tags(s).strip()
+
+    # Isolate tail after final separator (handle legacy multiple separators)
     if sep in s:
         tail = s.rsplit(sep, 1)[1]
         if sep in tail:
@@ -1574,10 +1579,9 @@ def _extract_full_text(note: str) -> str:
     else:
         tail = s
 
-    # Strip ANY stray [sid:...] occurrences that might have leaked inside the text
-    tail = re.sub(r"\[sid:[0-9a-fA-F-]{36}\]", "", tail)
+    tail = rm_uuid_tags(tail)
 
-    # Remove leading dot-buffer/blank lines and trailing blank lines
+    # Trim leading dot-buffer/blank lines and trailing blanks
     lines = tail.splitlines()
     i = 0
     while i < len(lines) and (not lines[i].strip() or lines[i].strip() == buf_token):
@@ -1590,6 +1594,7 @@ def _extract_full_text(note: str) -> str:
 
 
 
+
 # Word regex and obfuscation
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z’']*")
 
@@ -1597,10 +1602,10 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z’']*")
 
 def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
     """
-    Obfuscate ~ (1 - visible_ratio) of eligible words in full_text.
-    - Eligible word: >= OBF_MIN_LEN letters.
-    - If OBF_KEEP_FL is True -> keep first/last letters; otherwise replace FULL word letters with underscores.
-    - Preserves punctuation and whitespace exactly.
+    Obfuscate ~ (1 - visible_ratio) of eligible words.
+    - Eligible: words with >= OBF_MIN_LEN letters.
+    - keep_first_last config controls whether we preserve first/last letters.
+    - Preserves punctuation/spacing exactly.
     """
     vis = max(0.0, min(1.0, float(visible_ratio)))
     if vis >= 0.999:
@@ -1609,18 +1614,16 @@ def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
     min_len = int(globals().get("OBF_MIN_LEN", 3))
     keep_first_last = bool(globals().get("OBF_KEEP_FL", False))
 
-    # Gather eligible word spans
+    # Gather eligible word spans using global _WORD_RE
     spans = []
     for m in _WORD_RE.finditer(full_text):
         w = m.group(0)
         letters = sum(1 for c in w if c.isalpha())
         if letters >= min_len:
             spans.append((m.start(), m.end(), w))
-
     if not spans:
         return full_text
 
-    # Choose how many to blank
     blank_frac = 1.0 - vis
     k = int(round(blank_frac * len(spans)))
     if k <= 0:
@@ -1629,11 +1632,10 @@ def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
     rnd = random.Random(seed)
     to_blank = set(rnd.sample(range(len(spans)), k))
 
-    # Build masked result
     out = []
     last = 0
-    for idx, (s, e, w) in enumerate(spans):
-        out.append(full_text[last:s])
+    for idx, (s0, e0, w) in enumerate(spans):
+        out.append(full_text[last:s0])
         if idx in to_blank:
             if keep_first_last and len(w) >= 2:
                 core = "".join("_" if c.isalpha() else c for c in w[1:-1])
@@ -1643,35 +1645,39 @@ def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
             out.append(masked)
         else:
             out.append(w)
-        last = e
+        last = e0
     out.append(full_text[last:])
     return "".join(out)
 
 
+
 def _ratio_for_monthly_count(mcount: int) -> float:
     """
-    Map Monthly completion count to the configured visibility schedule.
+    Interpolate visible ratio across OBF_SCHEDULE over MONTHLY_REPEATS.
+    Robust to any schedule length; returns last value at the end.
     """
-    schedule = globals().get("OBF_SCHEDULE", [1.0, 0.75, 0.5, 0.35, 0.2])
+    schedule = list(globals().get("OBF_SCHEDULE", [1.0, 0.75, 0.5, 0.35, 0.2]))
     repeats = int(globals().get("MONTHLY_REPEATS", 24))
     if not schedule:
         return 1.0
     if len(schedule) == 1:
         return float(schedule[0])
+
     denom = max(1, repeats - 1)
-    p = max(0.0, min(1.0, float(mcount) / float(denom)))
+    p = max(0.0, min(1.0, float(mcount) / float(denom)))  # 0..1
     steps = len(schedule) - 1
     x = p * steps
     i = int(x)
     if i >= steps:
         return float(schedule[-1])
-    frac = x - i
     a = float(schedule[i]); b = float(schedule[i + 1])
+    frac = x - i
     return a * (1.0 - frac) + b * frac
+
 
 def _note_with_obfuscation(full_text: str, visible_ratio: float, seed: int) -> str:
     """
-    Canonical Monthly note (WITHOUT SID appended):
+    Canonical Monthly note (NO SID here):
       [OBFUSCATED TEXT]
 
       .        (N dot lines)
@@ -1688,18 +1694,14 @@ def _note_with_obfuscation(full_text: str, visible_ratio: float, seed: int) -> s
     buf_token = str(globals().get("OBF_BUFFER_TOKEN", "."))
     sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
 
-    # Build dot buffer (each line contains just the token)
     buffer_block = "\n".join(buf_token for _ in range(max(0, buf_lines)))
     parts = [obf]
     if buffer_block:
         parts.append(buffer_block)
-    # Separator already includes leading/trailing newlines by config; keep consistent:
     parts.append(sep.rstrip("\n"))
     parts.append(full_text.strip())
 
-    # Assemble with blank lines between major sections
-    body = "\n\n".join(parts).rstrip()
-    return body
+    return "\n\n".join(parts).rstrip()
 
 
 def _weekly_seed_for(title: str, now: datetime) -> int:
