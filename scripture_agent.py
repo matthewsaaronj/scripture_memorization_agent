@@ -109,7 +109,11 @@ DEFAULT_CONFIG = {
         "respect_punctuation": True,
         "buffer_lines": 4,
         "buffer_token": "."
+    },
+    "maintenance": {
+    "doctor_fix_cadence_days": 7  # 0 = disabled; run at most once every N days
     }
+
 }
 
 def _ensure_config_dir():
@@ -140,6 +144,51 @@ def load_or_init_config() -> dict:
         _save_json(CONFIG_PATH, cfg)
         print(f"[config] created default config at {CONFIG_PATH}")
     return cfg
+
+def _get_last_doctor_fix_date() -> Optional[datetime]:
+    st = _load_state()
+    iso = st.get("last_doctor_fix")
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except Exception:
+        return None
+
+def _set_last_doctor_fix_date(d: datetime) -> None:
+    st = _load_state()
+    st["last_doctor_fix"] = d.isoformat()
+    _save_state(st)
+
+def _run_scheduled_fix_if_due(now: datetime) -> None:
+    """
+    If maintenance cadence is configured and we're due, run a lightweight '--fix':
+      - SID sweep on Daily/Weekly/Monthly
+      - Title-change repair (SID-anchored)
+    Records the run time in state to avoid re-running too frequently.
+    """
+    try:
+        cfg = load_or_init_config()
+        apply_config(cfg)
+        cadence = int((cfg.get("maintenance", {}) or {}).get("doctor_fix_cadence_days", 0))
+        if cadence <= 0:
+            return
+
+        last = _get_last_doctor_fix_date()
+        if last and (now.date() - last.date()).days < cadence:
+            return  # not due yet
+
+        # Perform the same actions as doctor --fix, but quiet
+        total_added = 0
+        for ln in (DAILY, WEEKLY, MONTHLY):
+            total_added += sid_sweep_for_list(ln)
+        migrated = _doctor_title_change_repair()
+
+        _append_log(f"scheduled-fix: SID+repair added_sids={total_added}, migrated={migrated}")
+        _set_last_doctor_fix_date(now)
+    except Exception as e:
+        _append_log(f"scheduled-fix ERROR: {e}")
+
 
 def apply_config(cfg: dict):
     global BACKLOG, DAILY, WEEKLY, MONTHLY, MASTERED
@@ -1085,6 +1134,7 @@ def advance_on_complete():
         if not r["completed"]:
             continue
         title = r["name"]
+        _maybe_migrate_state_on_touch(DAILY, r)  # opportunistic SID-based title migration (no extra I/O)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
 
@@ -1112,6 +1162,7 @@ def advance_on_complete():
         if not r["completed"]:
             continue
         title = r["name"]
+        _maybe_migrate_state_on_touch(WEEKLY, r)  # opportunistic SID-based title migration (no extra I/O)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         wcount = int(rec.get("weekly_count", 0))
@@ -1142,6 +1193,7 @@ def advance_on_complete():
         if not r["completed"]:
             continue
         title = r["name"]
+        _maybe_migrate_state_on_touch(MONTHLY, r) 
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         mcount = int(rec.get("monthly_count", 0)) + 1  # count this completion
@@ -1174,6 +1226,7 @@ def advance_on_complete():
         if not r["completed"]:
             continue
         title = r["name"]
+        _maybe_migrate_state_on_touch(MASTERED, r) # opportunistic SID-based title migration (no extra I/O)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         k = int(rec.get("mastered_count", 0)) + 1  # increment mastered completions
@@ -1318,6 +1371,7 @@ def fill_notes_for_weekly():
                     filled += 1
                     _ensure_sid_for_title(WEEKLY, it["name"])
                     _ingest_full_text_from_note(WEEKLY, it["id"], it["name"])
+                    _maybe_migrate_state_on_touch(WEEKLY, it) 
         except Exception as e:
             print(f"[weekly] fill-notes error for '{it.get('name','?')}': {e}")
     print(f"Filled notes for {filled} item(s) in Weekly.")
@@ -1334,6 +1388,7 @@ def fill_notes_for_monthly():
                     _ensure_sid_for_title(MONTHLY, it["name"])
                     _ingest_full_text_from_note(MONTHLY, it["id"], it["name"])
                     _ensure_canonical_monthly_note(it["name"], now)
+                    _maybe_migrate_state_on_touch(MONTHLY, it) 
         except Exception as e:
             print(f"[monthly] fill-notes error for '{it.get('name','?')}': {e}")
     print(f"Filled notes for {filled} item(s) in Monthly.")
@@ -1387,7 +1442,15 @@ def ensure_all_lists() -> None:
         print(f"[setup] {( 'OK ' if ok else 'ERR')}  {ln}")
 
 def doctor():
+    """
+    Doctor checks:
+      - Config / lists / API probe / OPENAI key / state
+    If invoked with:  python scripture_agent.py doctor --fix
+      - Run SID sweep on Daily/Weekly/Monthly
+      - Run title-change repair (SID-anchored) on Daily/Weekly/Monthly
+    """
     print("\n=== scripture_agent doctor ===")
+    # Load config
     try:
         cfg = load_or_init_config()
         apply_config(cfg)
@@ -1395,9 +1458,11 @@ def doctor():
     except Exception as e:
         print(f"[config] ERROR: {e}")
 
+    # Ensure lists
     print("[lists] ensuring all lists exist…")
     ensure_all_lists()
 
+    # Probe API
     probe_ref = "1 Nephi 1:1"
     print(f"[nephi] test-fetch '{probe_ref}' …")
     txt = fetch_scripture_text(probe_ref)
@@ -1405,21 +1470,80 @@ def doctor():
         snippet = " ".join([ln.strip() for ln in txt.splitlines() if ln.strip()][:2])
         print(f"[nephi] OK  (preview: {snippet[:120]}{'…' if len(snippet)>120 else ''})")
     else:
-        print("[nephi] WARN  could not retrieve sample passage; check network or API availability")
+        print("[nephi] WARN  could not retrieve sample passage; check network/API")
 
+    # OpenAI key presence
     key = os.environ.get("OPENAI_API_KEY", "")
-    if key:
-        print("[openai] OK  OPENAI_API_KEY present")
-    else:
-        print("[openai] WARN  OPENAI_API_KEY not set (ChatGPT fallback won’t run)")
+    print("[openai] " + ("OK  key present" if key else "WARN  key missing"))
 
+    # State access
     st = _load_state()
     if isinstance(st, dict) and "verses" in st:
         print(f"[state] OK  {len(st.get('verses', {}))} tracked verse(s)")
     else:
         print("[state] WARN  could not read state file")
 
-    print("=== doctor done ===\n")
+    # Fix mode?
+    fix_mode = any(arg.strip() == "--fix" for arg in sys.argv[2:])
+    if not fix_mode:
+        print("=== doctor done (no --fix) ===\n")
+        return
+
+    print("\n=== doctor --fix repairs ===")
+    # Fill missing note content first (prevents SID-only notes)
+    for ln in (DAILY, WEEKLY, MONTHLY):
+        try:
+            for it in list_reminders(ln):
+                if not (it.get("body") or "").strip():
+                    _refresh_text_and_note(ln, it)
+        except Exception as e:
+            print(f"[fix] fill-missing {ln} ERROR: {e}")
+
+    # A) SID sweep
+    total_added = 0
+    for ln in (DAILY, WEEKLY, MONTHLY):
+        try:
+            added = sid_sweep_for_list(ln)
+            print(f"[fix] SID sweep {ln}: +{added}")
+            total_added += added
+        except Exception as e:
+            print(f"[fix] SID sweep {ln} ERROR: {e}")
+    _append_log(f"doctor --fix: SID sweep added {total_added} SID(s)")
+
+    # B) Title-change repair (SID-anchored)
+    try:
+        migrated = _doctor_title_change_repair()
+        print(f"[fix] Title-change repairs (SID-anchored): {migrated}")
+        _append_log(f"doctor --fix: title-change repairs {migrated}")
+    except Exception as e:
+        print(f"[fix] Title-change repair ERROR: {e}")
+
+    print("=== doctor --fix done ===\n")
+
+def _doctor_title_change_repair() -> int:
+    """
+    Sweep Daily/Weekly/Monthly using sanitized bodies only.
+    For any item whose SID maps to a *different* title in state, migrate the record
+    to the current title and refresh canonical text for that new title, rebuilding the note.
+    Returns count of migrations performed.
+    """
+    migrated = 0
+    for ln in (DAILY, WEEKLY, MONTHLY):
+        try:
+            for it in list_reminders(ln):
+                sid = _extract_sid_from_text(it.get("body",""))
+                if not sid:
+                    continue
+                # Try migration
+                moved = _migrate_state_title_by_sid(it.get("name",""), sid)
+                if moved:
+                    migrated += 1
+                    # After migrating to the new title, refresh full_text & rebuild the note
+                    _refresh_text_and_note(ln, it)
+        except Exception as e:
+            _append_log(f"[doctor_repair] ERROR scanning '{ln}': {e}")
+    return migrated
+
 
 
 # ====================================================================
@@ -1682,6 +1806,38 @@ def _roll_obf_salt(title: str) -> int:
     _update_record(title, obf_salt=int(salt))
     return int(salt)
 
+def _refresh_text_and_note(list_name: str, item: dict) -> bool:
+    """
+    For a given reminder item (already in hand), fetch canonical text for its *current title*,
+    persist to state, and rebuild the note in the list's appropriate format.
+    Respects #manual_override via ensure_notes_for().
+    Returns True if we wrote note content.
+    """
+    title = (item.get("name") or "").strip()
+    if not title:
+        return False
+
+    # Fetch canonical scripture text for the *current* title.
+    txt = fetch_scripture_text(title) or ""
+    if not txt:
+        return False
+
+    _update_record(title, full_text=txt, full_text_sha=_sha1(txt))
+
+    # Rebuild note content:
+    if list_name == MONTHLY:
+        # canonical monthly format (obfuscated header + separator + full text + SID)
+        ok = _ensure_canonical_monthly_note(title, datetime.now())
+        if ok:
+            _ensure_sid_for_title(MONTHLY, title)
+        return bool(ok)
+    else:
+        # Daily/Weekly: ensure canonical text; this respects #manual_override
+        ok = ensure_notes_for(list_name, title)
+        if ok:
+            _ensure_sid_for_title(list_name, title)
+        return bool(ok)
+
 
 # ====================================================================
 # SID helpers
@@ -1711,37 +1867,105 @@ def _sha1(s: str) -> str:
 
 def sid_sweep_for_list(list_name: str) -> int:
     """
-    Ensure every reminder in the given list has a [sid:UUID] footer.
-    - Fast path: check sanitized body from list_reminders() for '[sid:'.
-    - Only fetch RAW body + write for items that appear to be missing a SID.
-    - Always safe to append a SID even if #manual_override exists (SID is metadata).
-    Returns the number of SIDs added.
+    Ensure every item in list_name has a SID, but never leave a 'SID-only' note.
+    - If body is blank: fill text first (state-first -> API), then append SID.
+    - If body has text and no SID: append SID.
+    Returns the number of SIDs newly added.
     """
     added = 0
-    try:
-        items = list_reminders(list_name)
-    except Exception as e:
-        _append_log(f"[sid_sweep] list_reminders error for '{list_name}': {e}")
-        return 0
+    for it in list_reminders(list_name):
+        body = (it.get("body") or "").strip()
+        has_sid = bool(_extract_sid_from_text(body))
+        if has_sid:
+            continue
 
-    for it in items:
-        try:
-            body_sanitized = it.get("body") or ""
-            if _extract_sid(body_sanitized):
-                continue  # already has a SID (sanitized still preserves the token)
-            note_raw = get_body_by_id_raw(list_name, it["id"])
-            # Double-check raw too, to avoid rewriting if one is present but was lost in sanitization
-            if _extract_sid(note_raw):
-                continue
-            sid = _new_sid()
-            if set_body_by_id(list_name, it["id"], _append_sid(note_raw, sid)):
-                rec = _get_or_init_record(it["name"])
-                if rec.get("sid") != sid:
-                    _update_record(it["name"], sid=sid)
-                added += 1
-        except Exception as e:
-            _append_log(f"[sid_sweep] ERROR for '{it.get('name','?')}' on '{list_name}': {e}")
+        # If the body is empty, fill canonical text first (so SID isn't the only content).
+        if not body:
+            if _refresh_text_and_note(list_name, it):
+                added += 1  # _ensure_sid_for_title() is called inside
+            else:
+                # Try a last-resort ensure (may no-op on manual_override)
+                if ensure_notes_for(list_name, it.get("name","")):
+                    _ensure_sid_for_title(list_name, it.get("name",""))
+                    added += 1
+            continue
+
+        # Body has text but no SID → append SID only
+        sid = _ensure_sid_for_title(list_name, it.get("name",""))
+        if sid:
+            added += 1
+
     return added
+
+
+def _extract_sid_from_text(s: str) -> Optional[str]:
+    """Extract [sid:UUID] from a sanitized (flattened) body string."""
+    if not s:
+        return None
+    m = re.search(r"\[sid:([0-9a-fA-F-]{36})\]", s)
+    return m.group(1) if m else None
+
+def _sid_index_from_state() -> dict:
+    """Return {sid: normalized_title_key} for all verses in state that have a sid."""
+    st = _load_state()
+    out = {}
+    for k, rec in (st.get("verses") or {}).items():
+        sid = rec.get("sid")
+        if sid:
+            out[sid] = k
+    return out
+
+def _migrate_state_title_by_sid(current_title: str, sid: str) -> bool:
+    """
+    If 'sid' exists in state under a different title key, move that record to 'current_title'.
+    Returns True if a migration occurred.
+    """
+    if not sid:
+        return False
+    state = _load_state()
+    verses = state.setdefault("verses", {})
+    sid_map = { (rec.get("sid") or ""): key for key, rec in verses.items() if rec.get("sid") }
+
+    old_key = sid_map.get(sid)
+    new_key = _norm_title(current_title)
+    if not old_key or old_key == new_key:
+        return False
+
+    # If a record already exists at new_key, do not overwrite; log and skip (safest behavior).
+    if new_key in verses:
+        _append_log(f"[migrate] SKIP merge: '{current_title}' already exists; keeping both (old key: {old_key})")
+        return False
+
+    rec = verses.get(old_key)
+    if not rec:
+        return False
+
+    # Update canonical title; keep all counters/stage/anchor/full_text intact
+    rec["title"] = current_title.strip()
+    verses[new_key] = rec
+    try:
+        del verses[old_key]
+    except Exception:
+        pass
+
+    _save_state(state)
+    _append_log(f"[migrate] moved state '{old_key}' → '{new_key}' via SID {sid}")
+    return True
+
+def _maybe_migrate_state_on_touch(list_name: str, item: dict) -> bool:
+    """
+    Lightweight: use the item's sanitized body to grab SID (no extra raw read),
+    and migrate state to the item's current title if needed. Returns True if migrated.
+    """
+    try:
+        sid = _extract_sid_from_text(item.get("body", ""))
+        if not sid:
+            return False
+        return _migrate_state_title_by_sid(item.get("name", ""), sid)
+    except Exception as e:
+        _append_log(f"[migrate_touch] ERROR for '{item.get('name','?')}' on '{list_name}': {e}")
+        return False
+
 
 # ====================================================================
 # CSV logging
@@ -1766,16 +1990,16 @@ def _append_csv_event(title: str, stage: str, action: str, next_due: str = "") -
 def run_daily(topic_arg: Optional[str] = None):
     """
     One 'daily' run:
-      1) advance_on_complete()  # handles Daily/Weekly/Monthly/Mastered rescheduling & promotions
+      1) advance_on_complete()  # handles D/W/M/M* rescheduling & promotions
       2) fill_notes_for_daily()
       3) fill_notes_for_weekly()
       4) fill_notes_for_monthly()
       5) maybe_add_new_verse_from_backlog()
+      6) scheduled weekly '--fix' if due (config-driven; minimal overhead)
     """
     cfg = load_or_init_config()
     apply_config(cfg)
 
-    # Pick topic: CLI beats config; empty string means "no topic"
     cfg_topic = (cfg.get("auto_add", {}) or {}).get("topic_default", "") or None
     topic = topic_arg if (topic_arg and topic_arg.strip()) else cfg_topic
 
@@ -1814,7 +2038,14 @@ def run_daily(topic_arg: Optional[str] = None):
     except Exception as e:
         _append_log(f"run-daily: maybe_add_new_verse_from_backlog ERROR: {e}")
 
+    # Scheduled maintenance (quiet, config-driven)
+    try:
+        _run_scheduled_fix_if_due(datetime.now())
+    except Exception as e:
+        _append_log(f"run-daily: scheduled-fix ERROR: {e}")
+
     _append_log("run-daily: done")
+
 
 
 
