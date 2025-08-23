@@ -1108,10 +1108,10 @@ def advance_on_complete():
                 _append_csv_event(title, "weekly", "promoted", wdue.strftime('%Y-%m-%d 08:00'))
 
     # ===== Weekly stage =====
-    for it in list_reminders(WEEKLY):
-        if not it["completed"]:
+    for r in list_reminders(WEEKLY):
+        if not r["completed"]:
             continue
-        title = it["name"]
+        title = r["name"]
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         wcount = int(rec.get("weekly_count", 0))
@@ -1132,15 +1132,16 @@ def advance_on_complete():
             _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, monthly_count=0, anchor_weekday=anchor)
             _ensure_canonical_monthly_note(title, now)
             if OBF_ENABLED:
+                _roll_obf_salt(title)                  # NEW: new month → new pattern
                 _refresh_monthly_obfuscation(title, now)
             print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y 08:00')}")
             _append_csv_event(title, "monthly", "promoted", mdue.strftime('%Y-%m-%d 08:00'))
 
     # ===== Monthly stage =====
-    for it in list_reminders(MONTHLY):
-        if not it["completed"]:
+    for r in list_reminders(MONTHLY):
+        if not r["completed"]:
             continue
-        title = it["name"]
+        title = r["name"]
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         mcount = int(rec.get("monthly_count", 0)) + 1  # count this completion
@@ -1163,15 +1164,16 @@ def advance_on_complete():
             _update_record(title, stage="monthly", monthly_count=mcount, anchor_weekday=anchor)
             _ensure_canonical_monthly_note(title, now)
             if OBF_ENABLED:
+                _roll_obf_salt(title)                  # NEW: increment month → new pattern
                 _refresh_monthly_obfuscation(title, now)
             print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')} ({mcount}/{MONTHLY_REPEATS})")
             _append_csv_event(title, "monthly", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
 
     # ===== Mastered stage =====
-    for it in list_reminders(MASTERED):
-        if not it["completed"]:
+    for r in list_reminders(MASTERED):
+        if not r["completed"]:
             continue
-        title = it["name"]
+        title = r["name"]
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         k = int(rec.get("mastered_count", 0)) + 1  # increment mastered completions
@@ -1425,25 +1427,65 @@ def doctor():
 # ====================================================================
 def _extract_full_text(note: str) -> str:
     """
-    Return the full-text section: content after the LAST separator.
-    If none found, return the entire note trimmed.
+    Extract canonical FULL ORIGINAL TEXT from a note:
+      - Take content AFTER the LAST obfuscation separator.
+      - If that tail still contains separators (from past duplication), take only the content after the last one.
+      - Strip ANY [sid:UUID] tokens that might have been embedded.
+      - Trim leading/trailing dot-buffer and blank lines.
+    If no separator exists, return entire note minus any [sid:...] tokens and spacer lines.
     """
     sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
-    note = (note or "")
-    parts = note.rsplit(sep, 1)
-    return parts[1].strip() if len(parts) == 2 else note.strip()
+    buf_token = str(globals().get("OBF_BUFFER_TOKEN", "."))
+    s = (note or "")
+
+    # Remove trailing SID footer if present
+    s = re.sub(r"\s*\[sid:[0-9a-fA-F-]{36}\]\s*\Z", "", s.strip(), flags=re.MULTILINE)
+
+    # Isolate "full text" region: take tail after the final separator;
+    # if multiple separators exist in that tail (due to prior duplication), keep only after the last.
+    if sep in s:
+        tail = s.rsplit(sep, 1)[1]
+        if sep in tail:
+            tail = tail.rsplit(sep, 1)[1]
+    else:
+        tail = s
+
+    # Strip ANY stray [sid:...] occurrences that might have leaked inside the text
+    tail = re.sub(r"\[sid:[0-9a-fA-F-]{36}\]", "", tail)
+
+    # Remove leading dot-buffer/blank lines and trailing blank lines
+    lines = tail.splitlines()
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or lines[i].strip() == buf_token):
+        i += 1
+    j = len(lines)
+    while j > i and not lines[j - 1].strip():
+        j -= 1
+
+    return "\n".join(lines[i:j]).strip()
+
+
 
 # Word regex and obfuscation
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z’']*")
 
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z’']*")
+
 def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
-    """Blank out ~ (1-visible_ratio) of eligible words using underscores; preserve punctuation/spacing."""
-    if visible_ratio >= 0.999:
+    """
+    Obfuscate ~ (1 - visible_ratio) of eligible words in full_text.
+    - Eligible word: >= OBF_MIN_LEN letters.
+    - If OBF_KEEP_FL is True -> keep first/last letters; otherwise replace FULL word letters with underscores.
+    - Preserves punctuation and whitespace exactly.
+    """
+    vis = max(0.0, min(1.0, float(visible_ratio)))
+    if vis >= 0.999:
         return full_text
+
     min_len = int(globals().get("OBF_MIN_LEN", 3))
     keep_first_last = bool(globals().get("OBF_KEEP_FL", False))
 
-    # Find eligible word spans
+    # Gather eligible word spans
     spans = []
     for m in _WORD_RE.finditer(full_text):
         w = m.group(0)
@@ -1454,19 +1496,21 @@ def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
     if not spans:
         return full_text
 
-    blank_frac = max(0.0, min(1.0, 1.0 - float(visible_ratio)))
+    # Choose how many to blank
+    blank_frac = 1.0 - vis
     k = int(round(blank_frac * len(spans)))
     if k <= 0:
         return full_text
 
     rnd = random.Random(seed)
-    to_blank_idx = set(rnd.sample(range(len(spans)), k))
+    to_blank = set(rnd.sample(range(len(spans)), k))
 
+    # Build masked result
     out = []
     last = 0
     for idx, (s, e, w) in enumerate(spans):
         out.append(full_text[last:s])
-        if idx in to_blank_idx:
+        if idx in to_blank:
             if keep_first_last and len(w) >= 2:
                 core = "".join("_" if c.isalpha() else c for c in w[1:-1])
                 masked = w[0] + core + w[-1]
@@ -1478,6 +1522,7 @@ def _obfuscate_text(full_text: str, visible_ratio: float, seed: int) -> str:
         last = e
     out.append(full_text[last:])
     return "".join(out)
+
 
 def _ratio_for_monthly_count(mcount: int) -> float:
     """
@@ -1500,37 +1545,38 @@ def _ratio_for_monthly_count(mcount: int) -> float:
     a = float(schedule[i]); b = float(schedule[i + 1])
     return a * (1.0 - frac) + b * frac
 
-def _note_with_obfuscation(full_text: str, visible_ratio: float, seed: int, sid: Optional[str] = None) -> str:
+def _note_with_obfuscation(full_text: str, visible_ratio: float, seed: int) -> str:
     """
-    Canonical note format:
+    Canonical Monthly note (WITHOUT SID appended):
       [OBFUSCATED TEXT]
-      [dot buffer lines]
+
+      .        (N dot lines)
+      .
+      .
+      .
+
       ______________________________
       [FULL ORIGINAL TEXT]
-
-      [sid:...]
     """
-    obf = _obfuscate_text(full_text, visible_ratio, seed)
+    obf = _obfuscate_text(full_text.strip(), visible_ratio, seed)
 
-    # Build buffer block: N lines of dots, each on its own line
     buf_lines = int(globals().get("OBF_BUFFER_LINES", 4))
     buf_token = str(globals().get("OBF_BUFFER_TOKEN", "."))
     sep = globals().get("OBF_SEPARATOR", "\n\n______________________________\n")
 
-    buffer_block = "\n".join(buf_token for _ in range(buf_lines)) if buf_lines > 0 else ""
-
-    parts = [obf.strip()]
+    # Build dot buffer (each line contains just the token)
+    buffer_block = "\n".join(buf_token for _ in range(max(0, buf_lines)))
+    parts = [obf]
     if buffer_block:
         parts.append(buffer_block)
-    parts.append(sep + full_text.strip())
+    # Separator already includes leading/trailing newlines by config; keep consistent:
+    parts.append(sep.rstrip("\n"))
+    parts.append(full_text.strip())
 
-    body = "\n\n".join(parts)
-
-    if sid:
-        # Append SID with canonical 8-newline spacer
-        body = _append_sid(body, sid)
-
+    # Assemble with blank lines between major sections
+    body = "\n\n".join(parts).rstrip()
     return body
+
 
 def _weekly_seed_for(title: str, now: datetime) -> int:
     iso_year, iso_week, _ = now.isocalendar()
@@ -1543,31 +1589,23 @@ def _monthly_seed(title: str, rec: dict) -> int:
     return int(h, 16)
 
 def _ensure_dual_note_for_monthly(title: str, now: datetime) -> bool:
-    ln, it = _find_item_across_lists(title)
-    if ln != MONTHLY or not it:
-        return False
-    full = _extract_full_text(it["body"])
-    if not full:
-        full = fetch_scripture_text(title) or ""
-        if not full:
-            return False
-    rec = _get_or_init_record(title)
-    mcount = int(rec.get("monthly_count", 0))
-    ratio = _ratio_for_monthly_count(mcount)
-    seed = _weekly_seed_for(title, now)
-    # Preserve sid if present
-    note_raw = get_body_by_id_raw(ln, it["id"])
-    sid = _extract_sid(note_raw) or rec.get("sid")
-    new_body = _note_with_obfuscation(full, ratio, seed, sid=sid)
-    return set_body_by_id(MONTHLY, it["id"], new_body)
+    """
+    Legacy helper; now delegates to the canonical Monthly note builder to avoid
+    producing a second (duplicated) layout.
+    """
+    return _ensure_canonical_monthly_note(title, now)
+
 
 def _refresh_monthly_obfuscation(title: str, now: datetime) -> None:
-    if not OBF_ENABLED:
-        return
+    """
+    Single source of truth: delegate to the canonical Monthly builder.
+    This avoids a second rewrite that used to duplicate sections.
+    """
     try:
-        _ensure_dual_note_for_monthly(title, now)
+        _ensure_canonical_monthly_note(title, now)
     except Exception as e:
         _append_log(f"[obfuscate] ERROR for '{title}': {e}")
+
 
 def _resolve_full_text_for(title: str, list_name: str, rem_id: str) -> Optional[str]:
     rec = _get_or_init_record(title)
@@ -1589,23 +1627,42 @@ def _resolve_full_text_for(title: str, list_name: str, rem_id: str) -> Optional[
     return ft
 
 def _ensure_canonical_monthly_note(title: str, now: datetime) -> bool:
+    """
+    Rebuild the Monthly note from the canonical source of truth:
+      - Resolve full_text (state-first; else parse from note; else API).
+      - Compute visible ratio and seed for this month.
+      - Build a SINGLE clean canonical body (no duplicates).
+      - Append SID at the very bottom using the standard spacer.
+    """
     ln, it = _find_item_across_lists(title)
     if ln != MONTHLY or not it:
         return False
 
+    # Resolve canonical full text
     full = _resolve_full_text_for(title, ln, it["id"])
     if not full:
         return False
 
+    # Ratio & seed (seed may use obf_salt if present)
     rec = _get_or_init_record(title)
     ratio = _ratio_for_monthly_count(int(rec.get("monthly_count", 0)))
     seed = _monthly_seed(title, rec)
 
+    # Ensure/obtain SID
     note_raw = get_body_by_id_raw(ln, it["id"])
     sid = _extract_sid(note_raw) or rec.get("sid") or _ensure_sid_for_title(ln, title)
 
-    final_body = _note_with_obfuscation(full, ratio, seed, sid=sid)
-    return set_body_by_id(ln, it["id"], final_body)
+    # Build canonical body WITHOUT SID, then append SID with spacer
+    core = _note_with_obfuscation(full, ratio, seed)
+    final_body = _append_sid(core, sid)
+
+    # Only write if changed to avoid needless AppleScript writes
+    if note_raw.strip() != final_body.strip():
+        return set_body_by_id(ln, it["id"], final_body)
+    return True
+
+
+
 
 def _ingest_full_text_from_note(list_name: str, rem_id: str, title: str) -> None:
     try:
@@ -1615,6 +1672,15 @@ def _ingest_full_text_from_note(list_name: str, rem_id: str, title: str) -> None
     full = _extract_full_text(note_raw).strip()
     if full:
         _update_record(title, full_text=full, full_text_sha=_sha1(full))
+
+def _roll_obf_salt(title: str) -> int:
+    """
+    Generate and persist a new random obfuscation salt for this verse.
+    Called when entering Monthly or when monthly_count increments.
+    """
+    salt = random.getrandbits(32)
+    _update_record(title, obf_salt=int(salt))
+    return int(salt)
 
 
 # ====================================================================
