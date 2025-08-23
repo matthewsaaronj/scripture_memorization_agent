@@ -1753,14 +1753,20 @@ def _resolve_full_text_for(title: str, list_name: str, rem_id: str) -> Optional[
 def _ensure_canonical_monthly_note(title: str, now: datetime) -> bool:
     """
     Rebuild the Monthly note from the canonical source of truth:
+      - If '#manual_override' is present in the note, leave it untouched.
       - Resolve full_text (state-first; else parse from note; else API).
       - Compute visible ratio and seed for this month.
-      - Build a SINGLE clean canonical body (no duplicates).
+      - Build a SINGLE clean canonical body.
       - Append SID at the very bottom using the standard spacer.
     """
     ln, it = _find_item_across_lists(title)
     if ln != MONTHLY or not it:
         return False
+
+    # Read raw body first to check for manual override
+    note_raw = get_body_by_id_raw(ln, it["id"])
+    if _contains_manual_override(note_raw):
+        return True  # respect manual override, no rewrite
 
     # Resolve canonical full text
     full = _resolve_full_text_for(title, ln, it["id"])
@@ -1773,7 +1779,6 @@ def _ensure_canonical_monthly_note(title: str, now: datetime) -> bool:
     seed = _monthly_seed(title, rec)
 
     # Ensure/obtain SID
-    note_raw = get_body_by_id_raw(ln, it["id"])
     sid = _extract_sid(note_raw) or rec.get("sid") or _ensure_sid_for_title(ln, title)
 
     # Build canonical body WITHOUT SID, then append SID with spacer
@@ -1784,6 +1789,7 @@ def _ensure_canonical_monthly_note(title: str, now: datetime) -> bool:
     if note_raw.strip() != final_body.strip():
         return set_body_by_id(ln, it["id"], final_body)
     return True
+
 
 
 
