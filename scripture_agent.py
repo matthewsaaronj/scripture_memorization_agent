@@ -1284,13 +1284,27 @@ def dump_state():
         print("\n[STATE] (no state file yet)")
 
 def fill_notes_for_daily():
-    """Try to fill notes for any Daily reminders with blank notes (API)."""
+    """
+    Fill notes for Daily if blank (state-first; API fallback),
+    then ensure a SID for any item we actually filled,
+    and cache full_text in state from the note.
+    """
     filled = 0
+    sid_added = 0
     for it in list_reminders(DAILY):
-        if not (it["body"] or "").strip():
-            if ensure_notes_for_by_id(DAILY, it["id"], it["name"]):
-                filled += 1
-    print(f"Filled notes for {filled} item(s) in Daily.")
+        try:
+            if not (it["body"] or "").strip():
+                if ensure_notes_for_by_id(DAILY, it["id"], it["name"]):
+                    filled += 1
+                    # Reuse title-based SID helper for consistency (one list scan per filled item)
+                    sid = _ensure_sid_for_title(DAILY, it["name"])
+                    if sid:
+                        sid_added += 1
+                    _ingest_full_text_from_note(DAILY, it["id"], it["name"])
+        except Exception as e:
+            print(f"[daily] fill-notes error for '{it.get('name','?')}': {e}")
+    print(f"Filled notes for {filled} item(s) in Daily; ensured SID on {sid_added}.")
+
 
 def fill_notes_for_weekly():
     """Fill notes for Weekly if blank, then attach SID and cache full_text in state."""
@@ -1629,6 +1643,39 @@ def _ensure_sid_for_title(list_name: str, title: str) -> Optional[str]:
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
+def sid_sweep_for_list(list_name: str) -> int:
+    """
+    Ensure every reminder in the given list has a [sid:UUID] footer.
+    - Fast path: check sanitized body from list_reminders() for '[sid:'.
+    - Only fetch RAW body + write for items that appear to be missing a SID.
+    - Always safe to append a SID even if #manual_override exists (SID is metadata).
+    Returns the number of SIDs added.
+    """
+    added = 0
+    try:
+        items = list_reminders(list_name)
+    except Exception as e:
+        _append_log(f"[sid_sweep] list_reminders error for '{list_name}': {e}")
+        return 0
+
+    for it in items:
+        try:
+            body_sanitized = it.get("body") or ""
+            if _extract_sid(body_sanitized):
+                continue  # already has a SID (sanitized still preserves the token)
+            note_raw = get_body_by_id_raw(list_name, it["id"])
+            # Double-check raw too, to avoid rewriting if one is present but was lost in sanitization
+            if _extract_sid(note_raw):
+                continue
+            sid = _new_sid()
+            if set_body_by_id(list_name, it["id"], _append_sid(note_raw, sid)):
+                rec = _get_or_init_record(it["name"])
+                if rec.get("sid") != sid:
+                    _update_record(it["name"], sid=sid)
+                added += 1
+        except Exception as e:
+            _append_log(f"[sid_sweep] ERROR for '{it.get('name','?')}' on '{list_name}': {e}")
+    return added
 
 # ====================================================================
 # CSV logging
@@ -1653,13 +1700,16 @@ def _append_csv_event(title: str, stage: str, action: str, next_due: str = "") -
 def run_daily(topic_arg: Optional[str] = None):
     """
     One 'daily' run:
-      1) advance_on_complete()
+      1) advance_on_complete()  # handles Daily/Weekly/Monthly/Mastered rescheduling & promotions
       2) fill_notes_for_daily()
-      3) maybe_add_new_verse_from_backlog()
+      3) fill_notes_for_weekly()
+      4) fill_notes_for_monthly()
+      5) maybe_add_new_verse_from_backlog()
     """
     cfg = load_or_init_config()
     apply_config(cfg)
 
+    # Pick topic: CLI beats config; empty string means "no topic"
     cfg_topic = (cfg.get("auto_add", {}) or {}).get("topic_default", "") or None
     topic = topic_arg if (topic_arg and topic_arg.strip()) else cfg_topic
 
@@ -1678,6 +1728,18 @@ def run_daily(topic_arg: Optional[str] = None):
         _append_log(f"run-daily: fill_notes_for_daily ERROR: {e}")
 
     try:
+        fill_notes_for_weekly()
+        _append_log("run-daily: fill_notes_for_weekly OK")
+    except Exception as e:
+        _append_log(f"run-daily: fill_notes_for_weekly ERROR: {e}")
+
+    try:
+        fill_notes_for_monthly()
+        _append_log("run-daily: fill_notes_for_monthly OK")
+    except Exception as e:
+        _append_log(f"run-daily: fill_notes_for_monthly ERROR: {e}")
+
+    try:
         moved_or_added = maybe_add_new_verse_from_backlog(topic=topic)
         if moved_or_added:
             _append_log(f"run-daily: new verse added/moved → {moved_or_added}")
@@ -1687,6 +1749,7 @@ def run_daily(topic_arg: Optional[str] = None):
         _append_log(f"run-daily: maybe_add_new_verse_from_backlog ERROR: {e}")
 
     _append_log("run-daily: done")
+
 
 
 def ensure_all_lists_cmd():
