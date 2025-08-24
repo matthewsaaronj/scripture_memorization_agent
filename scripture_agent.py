@@ -1102,13 +1102,19 @@ def next_same_weekday_8am(anchor_weekday: int, base: datetime) -> datetime:
 # Advance-on-complete (cadence-aware)
 # ====================================================================
 def move_by_title(from_list: str, to_list: str, title: str) -> bool:
+    """
+    Move reminder by exact title from one list to another, preserving RAW body (newlines).
+    """
     wanted = title.strip().lower()
     items = list_reminders(from_list)
     match = next((x for x in items if x["name"].strip().lower() == wanted), None)
     if not match:
         return False
 
-    # create in destination
+    # Fetch RAW body from source (preserves paragraph breaks)
+    raw_body = get_body_by_id_raw(from_list, match["id"])
+
+    # Create in destination with RAW body
     create_script = r'''
     on run argv
       set listName to item 1 of argv
@@ -1120,11 +1126,12 @@ def move_by_title(from_list: str, to_list: str, title: str) -> bool:
       end tell
     end run
     '''
-    run_as(create_script, to_list, match["name"], match["body"])
+    run_as(create_script, to_list, match["name"], raw_body)
 
     # delete original by ID (robust)
     delete_by_id(from_list, match["id"])
     return True
+
 
 def advance_on_complete():
     now = datetime.now()
@@ -1135,6 +1142,7 @@ def advance_on_complete():
             continue
         title = r["name"]
         _maybe_migrate_state_on_touch(DAILY, r)  # opportunistic SID-based title migration (no extra I/O)
+        _opportunistic_fill_on_touch(DAILY, r)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
 
@@ -1163,6 +1171,7 @@ def advance_on_complete():
             continue
         title = r["name"]
         _maybe_migrate_state_on_touch(WEEKLY, r)  # opportunistic SID-based title migration (no extra I/O)
+        _opportunistic_fill_on_touch(WEEKLY, r)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         wcount = int(rec.get("weekly_count", 0))
@@ -1193,7 +1202,8 @@ def advance_on_complete():
         if not r["completed"]:
             continue
         title = r["name"]
-        _maybe_migrate_state_on_touch(MONTHLY, r) 
+        _maybe_migrate_state_on_touch(MONTHLY, r)
+        _opportunistic_fill_on_touch(MONTHLY, r)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         mcount = int(rec.get("monthly_count", 0)) + 1  # count this completion
@@ -1227,6 +1237,7 @@ def advance_on_complete():
             continue
         title = r["name"]
         _maybe_migrate_state_on_touch(MASTERED, r) # opportunistic SID-based title migration (no extra I/O)
+        _opportunistic_fill_on_touch(MASTERED, r)
         rec = _get_or_init_record(title)
         anchor = rec.get("anchor_weekday", now.weekday())
         k = int(rec.get("mastered_count", 0)) + 1  # increment mastered completions
@@ -1246,6 +1257,44 @@ def advance_on_complete():
         print(f"[Mastered] Rescheduled {title} ({schedule_label}); completed {k} mastered review(s)")
         _append_csv_event(title, "mastered", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
 
+def _opportunistic_fill_on_touch(list_name: str, item: dict) -> bool:
+    """
+    If state.full_text is missing for this title, fetch and cache it, then rebuild the note
+    (unless #manual_override appears in the sanitized body). Returns True if a rewrite occurred.
+    - Uses ONLY the sanitized body from list_reminders() to detect #manual_override (no raw read).
+    - Writes note only if we fetched text and need to canonicalize.
+    """
+    title = (item.get("name") or "").strip()
+    if not title:
+        return False
+
+    # Respect manual override (check sanitized body—marker still matches)
+    body_flat = (item.get("body") or "")
+    if "#manual_override" in body_flat.casefold():
+        return False
+
+    rec = _get_or_init_record(title)
+    if (rec.get("full_text") or "").strip():
+        return False  # state already has text; nothing to do
+
+    # Fetch canonical text once
+    txt = fetch_scripture_text(title) or ""
+    if not txt:
+        return False
+
+    _update_record(title, full_text=txt, full_text_sha=_sha1(txt))
+
+    # Rebuild the note in-place
+    if list_name == MONTHLY:
+        ok = _ensure_canonical_monthly_note(title, datetime.now())
+        if ok:
+            _ensure_sid_for_title(MONTHLY, title)
+        return bool(ok)
+    else:
+        ok = ensure_notes_for(list_name, title)
+        if ok:
+            _ensure_sid_for_title(list_name, title)
+        return bool(ok)
 
 def _weekday_name(ix: int) -> str:
     names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
@@ -1371,7 +1420,8 @@ def fill_notes_for_weekly():
                     filled += 1
                     _ensure_sid_for_title(WEEKLY, it["name"])
                     _ingest_full_text_from_note(WEEKLY, it["id"], it["name"])
-                    _maybe_migrate_state_on_touch(WEEKLY, it) 
+                    _maybe_migrate_state_on_touch(WEEKLY, it)
+                    _opportunistic_fill_on_touch(WEEKLY, it)
         except Exception as e:
             print(f"[weekly] fill-notes error for '{it.get('name','?')}': {e}")
     print(f"Filled notes for {filled} item(s) in Weekly.")
@@ -1388,7 +1438,8 @@ def fill_notes_for_monthly():
                     _ensure_sid_for_title(MONTHLY, it["name"])
                     _ingest_full_text_from_note(MONTHLY, it["id"], it["name"])
                     _ensure_canonical_monthly_note(it["name"], now)
-                    _maybe_migrate_state_on_touch(MONTHLY, it) 
+                    _maybe_migrate_state_on_touch(MONTHLY, it)
+                    _opportunistic_fill_on_touch(MONTHLY, it)
         except Exception as e:
             print(f"[monthly] fill-notes error for '{it.get('name','?')}': {e}")
     print(f"Filled notes for {filled} item(s) in Monthly.")
@@ -1498,6 +1549,12 @@ def doctor():
                     _refresh_text_and_note(ln, it)
         except Exception as e:
             print(f"[fix] fill-missing {ln} ERROR: {e}")
+    # Canonicalize non-blank, non-manual Daily/Weekly notes
+    try:
+        rew = _doctor_canonicalize_nonmonthly_notes()
+        print(f"[fix] Canonicalized Daily/Weekly notes: {rew}")
+    except Exception as e:
+        print(f"[fix] canonicalize ERROR: {e}")
 
     # A) SID sweep
     total_added = 0
@@ -1544,6 +1601,46 @@ def _doctor_title_change_repair() -> int:
             _append_log(f"[doctor_repair] ERROR scanning '{ln}': {e}")
     return migrated
 
+def _doctor_canonicalize_nonmonthly_notes() -> int:
+    """
+    Rewrite Daily/Weekly notes that already have content but no #manual_override,
+    forcing canonical scripture text (state-first; else API) and preserving/adding SID.
+    Returns number of notes rewritten.
+    """
+    rewritten = 0
+    for ln in (DAILY, WEEKLY):
+        try:
+            for it in list_reminders(ln):
+                # Read RAW body to check manual flag and compare precisely
+                raw = get_body_by_id_raw(ln, it["id"])
+                if not raw.strip():
+                    continue  # blank handled elsewhere
+                if _contains_manual_override(raw):
+                    continue
+
+                title = it.get("name", "").strip()
+                if not title:
+                    continue
+
+                # Resolve canonical text (prefer cached state)
+                rec = _get_or_init_record(title)
+                canonical = (rec.get("full_text") or "").strip()
+                if not canonical:
+                    canonical = (fetch_scripture_text(title) or "").strip()
+                    if not canonical:
+                        continue
+                    _update_record(title, full_text=canonical, full_text_sha=_sha1(canonical))
+
+                # Preserve/ensure SID
+                sid = _extract_sid(raw) or rec.get("sid") or _ensure_sid_for_title(ln, title)
+                new_body = _append_sid(canonical, sid)
+
+                if raw.strip() != new_body.strip():
+                    if set_body_by_id(ln, it["id"], new_body):
+                        rewritten += 1
+        except Exception as e:
+            _append_log(f"[doctor_canon] ERROR in {ln}: {e}")
+    return rewritten
 
 
 # ====================================================================
@@ -1815,36 +1912,22 @@ def _roll_obf_salt(title: str) -> int:
     return int(salt)
 
 def _refresh_text_and_note(list_name: str, item: dict) -> bool:
-    """
-    For a given reminder item (already in hand), fetch canonical text for its *current title*,
-    persist to state, and rebuild the note in the list's appropriate format.
-    Respects #manual_override via ensure_notes_for().
-    Returns True if we wrote note content.
-    """
     title = (item.get("name") or "").strip()
     if not title:
         return False
-
-    # Fetch canonical scripture text for the *current* title.
     txt = fetch_scripture_text(title) or ""
     if not txt:
         return False
-
     _update_record(title, full_text=txt, full_text_sha=_sha1(txt))
-
-    # Rebuild note content:
     if list_name == MONTHLY:
-        # canonical monthly format (obfuscated header + separator + full text + SID)
         ok = _ensure_canonical_monthly_note(title, datetime.now())
-        if ok:
-            _ensure_sid_for_title(MONTHLY, title)
+        if ok: _ensure_sid_for_title(MONTHLY, title)
         return bool(ok)
     else:
-        # Daily/Weekly: ensure canonical text; this respects #manual_override
         ok = ensure_notes_for(list_name, title)
-        if ok:
-            _ensure_sid_for_title(list_name, title)
+        if ok: _ensure_sid_for_title(list_name, title)
         return bool(ok)
+
 
 
 # ====================================================================
@@ -1907,11 +1990,11 @@ def sid_sweep_for_list(list_name: str) -> int:
 
 
 def _extract_sid_from_text(s: str) -> Optional[str]:
-    """Extract [sid:UUID] from a sanitized (flattened) body string."""
     if not s:
         return None
     m = re.search(r"\[sid:([0-9a-fA-F-]{36})\]", s)
     return m.group(1) if m else None
+
 
 def _sid_index_from_state() -> dict:
     """Return {sid: normalized_title_key} for all verses in state that have a sid."""
@@ -1924,55 +2007,42 @@ def _sid_index_from_state() -> dict:
     return out
 
 def _migrate_state_title_by_sid(current_title: str, sid: str) -> bool:
-    """
-    If 'sid' exists in state under a different title key, move that record to 'current_title'.
-    Returns True if a migration occurred.
-    """
     if not sid:
         return False
     state = _load_state()
     verses = state.setdefault("verses", {})
     sid_map = { (rec.get("sid") or ""): key for key, rec in verses.items() if rec.get("sid") }
-
     old_key = sid_map.get(sid)
     new_key = _norm_title(current_title)
-    if not old_key or old_key == new_key:
+    if not old_key or old_key == new_key or new_key in verses:
         return False
-
-    # If a record already exists at new_key, do not overwrite; log and skip (safest behavior).
-    if new_key in verses:
-        _append_log(f"[migrate] SKIP merge: '{current_title}' already exists; keeping both (old key: {old_key})")
-        return False
-
     rec = verses.get(old_key)
     if not rec:
         return False
-
-    # Update canonical title; keep all counters/stage/anchor/full_text intact
     rec["title"] = current_title.strip()
     verses[new_key] = rec
-    try:
-        del verses[old_key]
-    except Exception:
-        pass
-
+    try: del verses[old_key]
+    except Exception: pass
     _save_state(state)
-    _append_log(f"[migrate] moved state '{old_key}' → '{new_key}' via SID {sid}")
+    _append_log(f"[migrate] '{old_key}' → '{new_key}' via SID {sid}")
     return True
 
-def _maybe_migrate_state_on_touch(list_name: str, item: dict) -> bool:
+
+def _maybe_migrate_state_on_touch(list_name: str, item: dict) -> None:
     """
-    Lightweight: use the item's sanitized body to grab SID (no extra raw read),
-    and migrate state to the item's current title if needed. Returns True if migrated.
+    If sanitized body has a SID that maps to a different title in state,
+    migrate the record to the current title and refresh text/note once.
     """
     try:
         sid = _extract_sid_from_text(item.get("body", ""))
         if not sid:
-            return False
-        return _migrate_state_title_by_sid(item.get("name", ""), sid)
+            return
+        moved = _migrate_state_title_by_sid(item.get("name", ""), sid)
+        if moved:
+            _refresh_text_and_note(list_name, item)
     except Exception as e:
         _append_log(f"[migrate_touch] ERROR for '{item.get('name','?')}' on '{list_name}': {e}")
-        return False
+
 
 
 # ====================================================================
