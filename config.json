@@ -1,0 +1,49 @@
+{
+  "lists": {
+    "backlog": "Featherstone - Backlog",
+    "daily": "Featherstone - Daily",
+    "weekly": "Featherstone - Weekly",
+    "monthly": "Featherstone - Monthly",
+    "mastered": "Featherstone - Mastered"
+  },
+  "due_time": {
+    "hour": 22,
+    "minute": 0
+  },
+  "cadence": {
+    "daily_repeats": 7,
+    "weekly_repeats": 4,
+    "monthly_repeats": 24
+  },
+  "mastered": {
+    "review_months": [
+      3,
+      6,
+      12
+    ],
+    "yearly_interval": 12
+  },
+  "auto_add": {
+    "every_n_days": 7,
+    "topic_default" : "Broken Heart and Contrite Spirit"
+  },
+  "obfuscation": {
+    "enabled": true,
+    "separator": "\n\n______________________________\n",
+    "schedule": [
+      1.0,
+      0.75,
+      0.5,
+      0.35,
+      0.2
+    ],
+    "min_word_len": 3,
+    "keep_first_last": false,
+    "respect_punctuation": true,
+    "buffer_lines": 4,
+    "buffer_token": "."
+  },
+  "maintenance": {
+    "doctor_fix_cadence_days": 1
+  }
+}

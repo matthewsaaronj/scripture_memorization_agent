@@ -44,7 +44,8 @@ MASTERED_REVIEW_MONTHS = [3, 6, 12]
 MASTERED_YEARLY_INTERVAL = 12
 
 # ----- State file for cadence tracking -----
-CONFIG_DIR  = os.path.expanduser("~/.scripture_agent")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIR  = SCRIPT_DIR
 STATE_PATH  = os.path.join(CONFIG_DIR, "state.json")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 LOG_PATH    = os.path.join(CONFIG_DIR, "agent.log")
@@ -88,6 +89,11 @@ DEFAULT_CONFIG = {
         "monthly":  "Scripture Memorization - Monthly",
         "mastered": "Scripture Memorization - Mastered"
     },
+    "due_time": {
+        "hour": 8,
+        "minute": 0
+    },
+
     "cadence": {
         "daily_repeats":   7,
         "weekly_repeats":  4,
@@ -197,6 +203,11 @@ def apply_config(cfg: dict):
     WEEKLY   = cfg.get("lists", {}).get("weekly",   DEFAULT_CONFIG["lists"]["weekly"])
     MONTHLY  = cfg.get("lists", {}).get("monthly",  DEFAULT_CONFIG["lists"]["monthly"])
     MASTERED = cfg.get("lists", {}).get("mastered", DEFAULT_CONFIG["lists"]["mastered"])
+
+    global DUE_HOUR, DUE_MINUTE
+    dt_cfg = cfg.get("due_time", {}) or {}
+    DUE_HOUR = int(dt_cfg.get("hour", DEFAULT_CONFIG["due_time"]["hour"]))
+    DUE_MINUTE = int(dt_cfg.get("minute", DEFAULT_CONFIG["due_time"]["minute"]))
 
     global DAILY_REPEATS, WEEKLY_REPEATS, MONTHLY_REPEATS
     DAILY_REPEATS   = int(cfg.get("cadence", {}).get("daily_repeats",   DEFAULT_CONFIG["cadence"]["daily_repeats"]))
@@ -363,89 +374,92 @@ def set_body_by_id(list_name: str, rem_id: str, body: str) -> bool:
     '''
     return run_as(script, list_name, rem_id, body) == "OK"
 
-def set_due(list_name: str, title: str, due_dt: datetime) -> bool:
-    due_str = due_dt.strftime("%m/%d/%Y %H:%M:%S")
-    script = r'''
-    on run argv
-      set listName to item 1 of argv
-      set theTitle to item 2 of argv
-      set dueStr to item 3 of argv
-      tell application "Reminders"
-        set theList to first list whose name is listName
-        set targetRem to missing value
-        repeat with r in reminders of theList
-          if (name of r as text) is theTitle then
-            set targetRem to r
-            exit repeat
-          end if
-        end repeat
-        if targetRem is missing value then
-          return "NOT_FOUND"
-        else
-          try
-            set due date of targetRem to date dueStr
-            return "OK"
-          on error errMsg
-            return "ERR:" & errMsg
-          end try
-        end if
-      end tell
-    end run
-    '''
-    res = run_as(script, list_name, title, due_str)
-    return res == "OK"
+def _at_due_time(dt: datetime) -> datetime:
+    """Return dt at the configured due time (hour/minute, zero seconds)."""
+    return dt.replace(hour=DUE_HOUR, minute=DUE_MINUTE, second=0, microsecond=0)
+
+
+def set_due(list_name: str, reminder_id: str, y: int, m: int, d: int, hh: int, mm: int, ss: int = 0) -> bool:
+    """
+    Back-compat wrapper. Prefer set_due_date(list_name, reminder_id, when).
+    Safe to delete once no callers remain.
+    """
+    try:
+        when = datetime(int(y), int(m), int(d), int(hh), int(mm), int(ss))
+        return set_due_date(list_name, reminder_id, when)
+    except Exception as e:
+        _append_log(f"[set_due] wrapper ERROR for id={reminder_id} on '{list_name}': {e}")
+        return False
+
+
+def set_due_date(list_name: str, reminder_id: str, when: datetime) -> bool:
+    """
+    Set the due date of a reminder (by id) in the given list.
+    'when' is treated as local time.
+    """
+    try:
+        y, m, d = when.year, when.month, when.day
+        hh, mm, ss = when.hour, when.minute, when.second
+
+        applescript = r'''
+        on run argv
+          set listName to item 1 of argv
+          set rid to item 2 of argv
+          set y to (item 3 of argv) as integer
+          set m to (item 4 of argv) as integer
+          set d to (item 5 of argv) as integer
+          set hh to (item 6 of argv) as integer
+          set mm to (item 7 of argv) as integer
+          set ss to (item 8 of argv) as integer
+
+          set monthsList to {January, February, March, April, May, June, July, August, September, October, November, December}
+          set theMonth to item m of monthsList
+
+          set dueDate to (current date)
+          set year of dueDate to y
+          set month of dueDate to theMonth
+          set day of dueDate to d
+          set time of dueDate to (hh * hours + mm * minutes + ss)
+
+          tell application "Reminders"
+            set theList to first list whose name is listName
+            set theItem to (first reminder of theList whose id is rid)
+            set due date of theItem to dueDate
+          end tell
+        end run
+        '''
+        args = [list_name, reminder_id, str(y), str(m), str(d), str(hh), str(mm), str(ss)]
+        subprocess.run(["osascript", "-e", applescript, *args], check=True)
+        _append_log(f"[set_due] '{list_name}' id={reminder_id} → {when.isoformat()}")
+        return True
+    except subprocess.CalledProcessError as e:
+        _append_log(f"[set_due] AppleScript error for id={reminder_id} on '{list_name}': {e}")
+        return False
+    except Exception as e:
+        _append_log(f"[set_due] ERROR for id={reminder_id} on '{list_name}': {e}")
+        return False
+
 
 def set_due_next_morning_8am(list_name: str, title: str) -> bool:
-    """Robust AppleScript date construction for next morning 08:00 local."""
-    dt_target = (datetime.now() + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
-    y = str(dt_target.year)
-    m = str(dt_target.month)   # 1-12
-    d = str(dt_target.day)
-    hh = str(dt_target.hour)   # 8
-    mm = str(dt_target.minute) # 0
+    """Set due for the reminder (by title) to next morning at configured due time, via the id-based setter."""
+    try:
+        items = list_reminders(list_name)
+        rid = None
+        for it in items:
+            if (it.get("name") or "") == title:
+                rid = it.get("id")
+                break
+        if not rid:
+            _append_log(f"[set_due_next_morning_8am] NOT_FOUND '{title}' in '{list_name}'")
+            return False
 
-    script = r'''
-    on run argv
-      set listName to item 1 of argv
-      set theTitle to item 2 of argv
-      set y to (item 3 of argv) as integer
-      set mIndex to (item 4 of argv) as integer
-      set d to (item 5 of argv) as integer
-      set hh to (item 6 of argv) as integer
-      set mm to (item 7 of argv) as integer
+        dt_target = _at_due_time(datetime.now() + timedelta(days=1))
+        return set_due_date(list_name, rid, dt_target)
+    except Exception as e:
+        _append_log(f"[set_due_next_morning_8am] ERROR for '{title}' on '{list_name}': {e}")
+        return False
 
-      set monthList to {January, February, March, April, May, June, July, August, September, October, November, December}
-      set theMonth to item mIndex of monthList
 
-      tell application "Reminders"
-        if not (exists (list listName)) then return "NOT_FOUND"
-        set theList to first list whose name is listName
-        set targetRem to missing value
-        repeat with r in reminders of theList
-          if (name of r as text) is theTitle then
-            set targetRem to r
-            exit repeat
-          end if
-        end repeat
-        if targetRem is missing value then return "NOT_FOUND"
-      end tell
-
-      set theDate to (current date)
-      set year of theDate to y
-      set month of theDate to theMonth
-      set day of theDate to d
-      set hours of theDate to hh
-      set minutes of theDate to mm
-      set seconds of theDate to 0
-
-      tell application "Reminders"
-        set due date of targetRem to theDate
-      end tell
-      return "OK"
-    end run
-    '''
-    res = run_as(script, list_name, title, y, m, d, hh, mm)
-    return res == "OK"
 
 def delete_by_id(list_name: str, rem_id: str) -> bool:
     script = r'''
@@ -1078,43 +1092,137 @@ def _add_months(dt: datetime, months: int) -> datetime:
 
 def next_same_weekday_in_n_months_8am(anchor_weekday: int, base: datetime, months_ahead: int) -> datetime:
     target = _add_months(base, months_ahead)
-    return _first_weekday_on_or_after(
+    dt = _first_weekday_on_or_after(
         target.year,
         target.month,
         anchor_weekday,
         start_day=target.day
     )
+    return _at_due_time(dt)
+
+
+
 
 # ====================================================================
 # Cadence date helpers
 # ====================================================================
 def next_morning_8am(base: datetime) -> datetime:
-    return (base + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+    # now honors configured due time
+    return _at_due_time(base + timedelta(days=1))
+
 
 def next_same_weekday_8am(anchor_weekday: int, base: datetime) -> datetime:
+    # now honors configured due time
     days_ahead = (anchor_weekday - base.weekday()) % 7
     if days_ahead == 0:
         days_ahead = 7
     target = base + timedelta(days=days_ahead)
-    return target.replace(hour=8, minute=0, second=0, microsecond=0)
+    return _at_due_time(target)
+
+
+def _ensure_due_for_list(list_name: str, item: dict, now: Optional[datetime] = None) -> bool:
+    """
+    If 'item' has no due date, set the correct initial due date for its list.
+    - DAILY   → next morning 8:00 AM local
+    - WEEKLY  → next occurrence of the *current weekday* at 8:00 AM
+    - MONTHLY → first occurrence of the anchor weekday on/after the same day-of-month at 8:00 AM
+                (anchor_weekday comes from state; if absent, set it to now.weekday())
+    Returns True if we set a due date.
+    """
+    try:
+        if now is None:
+            now = datetime.now()
+        # If caller already supplied a parsed due, respect it
+        if (item.get("due") or "").strip():
+            return False
+
+        rid = item.get("id")
+        if not rid:
+            return False
+
+        # Helper: set time to configured due time
+        def at_8am(dt: datetime) -> datetime:
+            return _at_due_time(dt)
+
+
+        # DAILY → next morning 8am
+        if list_name == DAILY:
+            target = at_8am(now + timedelta(days=1))
+
+        # WEEKLY → next same weekday 8am
+        elif list_name == WEEKLY:
+            target = at_8am(now)
+            # if it's already past 8am today, push a week; otherwise schedule today 8am if in the future
+            if target <= now:
+                # next same weekday at 8am (i.e., +7 days from *today's* weekday)
+                target = at_8am(now + timedelta(days=7))
+
+        # MONTHLY → first occurrence of anchor weekday on/after same day-of-month at 8am
+        elif list_name == MONTHLY:
+            title = (item.get("name") or "").strip()
+            state = _load_state()
+            verses = state.setdefault("verses", {})
+            key = _norm_title(title)
+            rec = verses.get(key) or {}
+
+            # ensure anchor_weekday exists
+            if "anchor_weekday" not in rec or rec["anchor_weekday"] is None:
+                rec["anchor_weekday"] = now.weekday()
+                rec["title"] = title
+                verses[key] = rec
+                _save_state(state)
+
+            anchor_wd = int(rec["anchor_weekday"])
+
+            # base on this month's "same day-of-month" at 8am
+            y, m = now.year, now.month
+            dom = min(now.day, calendar.monthrange(y, m)[1])
+            base = at_8am(datetime(y, m, dom))
+
+            # if base already passed, start from next month same day-of-month
+            if base <= now:
+                # roll to next month
+                if m == 12:
+                    y, m = y + 1, 1
+                else:
+                    m += 1
+                dom = min(now.day, calendar.monthrange(y, m)[1])
+                base = at_8am(datetime(y, m, dom))
+
+            # walk forward to first occurrence of anchor weekday on/after base
+            delta = (anchor_wd - base.weekday()) % 7
+            target = base + timedelta(days=delta)
+
+        else:
+            return False  # unknown list, do nothing
+
+        # Apply due date via your existing AppleScript setter
+        set_due_date(list_name, rid, target)
+        _append_log(f"[ensure_due] set due for '{item.get('name','?')}' on '{list_name}' → {target.isoformat()}")
+        return True
+
+    except Exception as e:
+        _append_log(f"[ensure_due] ERROR for '{item.get('name','?')}' on '{list_name}': {e}")
+        return False
 
 # ====================================================================
 # Advance-on-complete (cadence-aware)
 # ====================================================================
-def move_by_title(from_list: str, to_list: str, title: str) -> bool:
+def move_by_title(from_list: str, to_list: str, title: str) -> Optional[str]:
     """
     Move reminder by exact title from one list to another, preserving RAW body (newlines).
+    Returns the NEW reminder ID in the destination list (or None on failure).
     """
     wanted = title.strip().lower()
     items = list_reminders(from_list)
     match = next((x for x in items if x["name"].strip().lower() == wanted), None)
     if not match:
-        return False
+        return None
 
     # Fetch RAW body from source (preserves paragraph breaks)
     raw_body = get_body_by_id_raw(from_list, match["id"])
 
-    # Create in destination with RAW body
+    # Create in destination and return its ID
     create_script = r'''
     on run argv
       set listName to item 1 of argv
@@ -1122,15 +1230,17 @@ def move_by_title(from_list: str, to_list: str, title: str) -> bool:
       set theBody to item 3 of argv
       tell application "Reminders"
         set theList to first list whose name is listName
-        make new reminder at end of reminders of theList with properties {name:theTitle, body:theBody}
+        set newRem to make new reminder at end of reminders of theList with properties {name:theTitle, body:theBody}
+        return (id of newRem as text)
       end tell
     end run
     '''
-    run_as(create_script, to_list, match["name"], raw_body)
+    new_id = run_as(create_script, to_list, match["name"], raw_body)
 
     # delete original by ID (robust)
     delete_by_id(from_list, match["id"])
-    return True
+    return new_id if (new_id and new_id.strip()) else None
+
 
 
 def advance_on_complete():
@@ -1149,21 +1259,27 @@ def advance_on_complete():
         if rec.get("stage") not in ("weekly", "monthly", "mastered"):
             dcount = int(rec.get("daily_count", 0))
             if dcount + 1 < DAILY_REPEATS:
-                due = next_morning_8am(now)
-                set_due(DAILY, title, due)
-                mark_incomplete_by_title(DAILY, title)
+                due = next_morning_8am(now)  # uses configured time
+                set_due_date(DAILY, r["id"], due)
+                mark_incomplete_by_id(DAILY, r["id"])
                 _update_record(title, stage="daily", daily_count=dcount + 1, anchor_weekday=anchor)
-                print(f"[Daily] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')}; day {dcount+1}/{DAILY_REPEATS}")
-                _append_csv_event(title, "daily", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
+                print(f"[Daily] Rescheduled {title} for {due.strftime('%m/%d/%Y %H:%M')}; day {dcount+1}/{DAILY_REPEATS}")
+                _append_csv_event(title, "daily", "rescheduled", due.strftime('%Y-%m-%d %H:%M'))
             else:
                 # Move to Weekly
-                move_by_title(DAILY, WEEKLY, title)
-                wdue = next_same_weekday_8am(anchor, now)
-                set_due(WEEKLY, title, wdue)
-                mark_incomplete_by_title(WEEKLY, title)
+                new_id = move_by_title(DAILY, WEEKLY, title)
+                wdue = next_same_weekday_8am(anchor, now)  # uses configured time
+                if not new_id:
+                    # Resolve defensively by title if needed
+                    for it2 in list_reminders(WEEKLY):
+                        if _norm_title(it2["name"]) == _norm_title(title):
+                            new_id = it2["id"]; break
+                if new_id:
+                    set_due_date(WEEKLY, new_id, wdue)
+                    mark_incomplete_by_id(WEEKLY, new_id)
                 _update_record(title, stage="weekly", daily_count=DAILY_REPEATS, weekly_count=0, anchor_weekday=anchor)
-                print(f"[Daily→Weekly] {title} scheduled {wdue.strftime('%m/%d/%Y 08:00')}")
-                _append_csv_event(title, "weekly", "promoted", wdue.strftime('%Y-%m-%d 08:00'))
+                print(f"[Daily→Weekly] {title} scheduled {wdue.strftime('%m/%d/%Y %H:%M')}")
+                _append_csv_event(title, "weekly", "promoted", wdue.strftime('%Y-%m-%d %H:%M'))
 
     # ===== Weekly stage =====
     for r in list_reminders(WEEKLY):
@@ -1178,24 +1294,29 @@ def advance_on_complete():
 
         if wcount + 1 < WEEKLY_REPEATS:
             wdue = next_same_weekday_8am(anchor, now)
-            set_due(WEEKLY, title, wdue)
-            mark_incomplete_by_title(WEEKLY, title)
+            set_due_date(WEEKLY, r["id"], wdue)
+            mark_incomplete_by_id(WEEKLY, r["id"])
             _update_record(title, stage="weekly", weekly_count=wcount + 1, anchor_weekday=anchor)
-            print(f"[Weekly] Rescheduled {title} for {wdue.strftime('%m/%d/%Y 08:00')}; week {wcount+1}/{WEEKLY_REPEATS}")
-            _append_csv_event(title, "weekly", "rescheduled", wdue.strftime('%Y-%m-%d 08:00'))
+            print(f"[Weekly] Rescheduled {title} for {wdue.strftime('%m/%d/%Y %H:%M')}; week {wcount+1}/{WEEKLY_REPEATS}")
+            _append_csv_event(title, "weekly", "rescheduled", wdue.strftime('%Y-%m-%d %H:%M'))
         else:
             # Move to Monthly and init monthly_count
-            move_by_title(WEEKLY, MONTHLY, title)
-            mdue = next_same_weekday_in_n_months_8am(anchor, now, 1)
-            set_due(MONTHLY, title, mdue)
-            mark_incomplete_by_title(MONTHLY, title)
+            new_id = move_by_title(WEEKLY, MONTHLY, title)
+            mdue = next_same_weekday_in_n_months_8am(anchor, now, 1)  # still computes 8am-equivalent via configured time later
+            if not new_id:
+                for it2 in list_reminders(MONTHLY):
+                    if _norm_title(it2["name"]) == _norm_title(title):
+                        new_id = it2["id"]; break
+            if new_id:
+                set_due_date(MONTHLY, new_id, mdue)
+                mark_incomplete_by_id(MONTHLY, new_id)
             _update_record(title, stage="monthly", weekly_count=WEEKLY_REPEATS, monthly_count=0, anchor_weekday=anchor)
             _ensure_canonical_monthly_note(title, now)
             if OBF_ENABLED:
                 _roll_obf_salt(title)                  # NEW: new month → new pattern
                 _refresh_monthly_obfuscation(title, now)
-            print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y 08:00')}")
-            _append_csv_event(title, "monthly", "promoted", mdue.strftime('%Y-%m-%d 08:00'))
+            print(f"[Weekly→Monthly] {title} scheduled {mdue.strftime('%m/%d/%Y %H:%M')}")
+            _append_csv_event(title, "monthly", "promoted", mdue.strftime('%Y-%m-%d %H:%M'))
 
     # ===== Monthly stage =====
     for r in list_reminders(MONTHLY):
@@ -1210,26 +1331,31 @@ def advance_on_complete():
 
         if mcount >= MONTHLY_REPEATS:
             # Graduate to Mastered
-            move_by_title(MONTHLY, MASTERED, title)
+            new_id = move_by_title(MONTHLY, MASTERED, title)
             first_gap = MASTERED_REVIEW_MONTHS[0] if MASTERED_REVIEW_MONTHS else MASTERED_YEARLY_INTERVAL
             due = next_same_weekday_in_n_months_8am(anchor, now, first_gap)
-            set_due(MASTERED, title, due)
-            mark_incomplete_by_title(MASTERED, title)
+            if not new_id:
+                for it2 in list_reminders(MASTERED):
+                    if _norm_title(it2["name"]) == _norm_title(title):
+                        new_id = it2["id"]; break
+            if new_id:
+                set_due_date(MASTERED, new_id, due)
+                mark_incomplete_by_id(MASTERED, new_id)
             _update_record(title, stage="mastered", monthly_count=mcount, mastered_count=0, anchor_weekday=anchor)
-            print(f"[Monthly→Mastered] {title} graduated after {MONTHLY_REPEATS} monthly reviews; next check {due.strftime('%m/%d/%Y 08:00')}")
-            _append_csv_event(title, "mastered", "promoted", due.strftime('%Y-%m-%d 08:00'))
+            print(f"[Monthly→Mastered] {title} graduated after {MONTHLY_REPEATS} monthly reviews; next check {due.strftime('%m/%d/%Y %H:%M')}")
+            _append_csv_event(title, "mastered", "promoted", due.strftime('%Y-%m-%d %H:%M'))
         else:
             # Stay Monthly
             due = next_same_weekday_in_n_months_8am(anchor, now, 1)
-            set_due(MONTHLY, title, due)
-            mark_incomplete_by_title(MONTHLY, title)
+            set_due_date(MONTHLY, r["id"], due)
+            mark_incomplete_by_id(MONTHLY, r["id"])
             _update_record(title, stage="monthly", monthly_count=mcount, anchor_weekday=anchor)
             _ensure_canonical_monthly_note(title, now)
             if OBF_ENABLED:
                 _roll_obf_salt(title)                  # NEW: increment month → new pattern
                 _refresh_monthly_obfuscation(title, now)
-            print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y 08:00')} ({mcount}/{MONTHLY_REPEATS})")
-            _append_csv_event(title, "monthly", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
+            print(f"[Monthly] Rescheduled {title} for {due.strftime('%m/%d/%Y %H:%M')} ({mcount}/{MONTHLY_REPEATS})")
+            _append_csv_event(title, "monthly", "rescheduled", due.strftime('%Y-%m-%d %H:%M'))
 
     # ===== Mastered stage =====
     for r in list_reminders(MASTERED):
@@ -1250,12 +1376,13 @@ def advance_on_complete():
             gap = MASTERED_YEARLY_INTERVAL
 
         due = next_same_weekday_in_n_months_8am(anchor, now, gap)
-        set_due(MASTERED, title, due)
-        mark_incomplete_by_title(MASTERED, title)
+        set_due_date(MASTERED, r["id"], due)
+        mark_incomplete_by_id(MASTERED, r["id"])
         _update_record(title, stage="mastered", mastered_count=k, anchor_weekday=anchor)
         schedule_label = f"next in {gap} mo" if k <= len(MASTERED_REVIEW_MONTHS) else "next yearly"
         print(f"[Mastered] Rescheduled {title} ({schedule_label}); completed {k} mastered review(s)")
-        _append_csv_event(title, "mastered", "rescheduled", due.strftime('%Y-%m-%d 08:00'))
+        _append_csv_event(title, "mastered", "rescheduled", due.strftime('%Y-%m-%d %H:%M'))
+
 
 def _opportunistic_fill_on_touch(list_name: str, item: dict) -> bool:
     """
@@ -1394,12 +1521,15 @@ def fill_notes_for_daily():
     and cache full_text in state from the note.
     """
     filled = 0
+    now = datetime.now()
     sid_added = 0
     for it in list_reminders(DAILY):
         try:
             if not (it["body"] or "").strip():
                 if ensure_notes_for_by_id(DAILY, it["id"], it["name"]):
                     filled += 1
+                    _ensure_due_for_list(DAILY, it, now)
+                    _maybe_migrate_state_on_touch(DAILY, it)
                     # Reuse title-based SID helper for consistency (one list scan per filled item)
                     sid = _ensure_sid_for_title(DAILY, it["name"])
                     if sid:
@@ -1413,6 +1543,7 @@ def fill_notes_for_daily():
 def fill_notes_for_weekly():
     """Fill notes for Weekly if blank, then attach SID and cache full_text in state."""
     filled = 0
+    now = datetime.now()
     for it in list_reminders(WEEKLY):
         try:
             if not (it["body"] or "").strip():
@@ -1420,6 +1551,7 @@ def fill_notes_for_weekly():
                     filled += 1
                     _ensure_sid_for_title(WEEKLY, it["name"])
                     _ingest_full_text_from_note(WEEKLY, it["id"], it["name"])
+                    _ensure_due_for_list(WEEKLY, it, now)
                     _maybe_migrate_state_on_touch(WEEKLY, it)
                     _opportunistic_fill_on_touch(WEEKLY, it)
         except Exception as e:
@@ -1437,6 +1569,7 @@ def fill_notes_for_monthly():
                     filled += 1
                     _ensure_sid_for_title(MONTHLY, it["name"])
                     _ingest_full_text_from_note(MONTHLY, it["id"], it["name"])
+                    _ensure_due_for_list(MONTHLY, it, now)
                     _ensure_canonical_monthly_note(it["name"], now)
                     _maybe_migrate_state_on_touch(MONTHLY, it)
                     _opportunistic_fill_on_touch(MONTHLY, it)
