@@ -601,7 +601,8 @@ def ref_overlaps_anywhere(candidate_ref: str) -> Optional[str]:
 
 def _http_get_json(url: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.7.1", "Accept": "*/*"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
         return json.loads(data.decode("utf-8", errors="ignore"))
     except Exception:
