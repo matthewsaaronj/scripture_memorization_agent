@@ -24,8 +24,8 @@
     "yearly_interval": 12
   },
   "auto_add": {
-    "every_n_days": 7,
-    "topic_default" : "Broken Heart and Contrite Spirit"
+    "every_n_days": 0,
+    "topic_default" : "The Book of Mormon"
   },
   "obfuscation": {
     "enabled": true,

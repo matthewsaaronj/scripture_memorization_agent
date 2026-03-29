@@ -1,0 +1,19 @@
+# Runtime state & data (copy manually between machines)
+state.json
+progress.csv
+
+# Logs
+agent.log
+launchd.out.log
+launchd.err.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/

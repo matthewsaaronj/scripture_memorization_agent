@@ -883,22 +883,123 @@ def ensure_notes_for_by_id(list_name: str, rem_id: str, title: str) -> bool:
 def _norm_title(t: str) -> str:
     return (t or "").strip().casefold().replace("–", "-")
 
+def reset_backlog_items():
+    """
+    Reset the stage and counts for any items in the backlog list.
+    This allows items moved back to backlog to start fresh when re-added to daily.
+    Preserves: title, sid, full_text, full_text_sha, obf_salt
+    Resets: stage, daily_count, weekly_count, monthly_count, mastered_count, anchor_weekday
+    """
+    try:
+        backlog_items = list_reminders(BACKLOG)
+        state = _load_state()
+        verses = state.setdefault("verses", {})
+        reset_count = 0
+
+        for item in backlog_items:
+            title = item["name"].strip()
+            key = _norm_title(title)
+            rec = verses.get(key)
+
+            # Only reset if there's an existing state record
+            if rec:
+                # Check if it needs resetting (has a stage other than backlog or has counts)
+                needs_reset = (
+                    rec.get("stage") not in [None, "backlog"] or
+                    rec.get("daily_count", 0) > 0 or
+                    rec.get("weekly_count", 0) > 0 or
+                    rec.get("monthly_count", 0) > 0 or
+                    rec.get("mastered_count", 0) > 0
+                )
+
+                if needs_reset:
+                    # Preserve these fields
+                    preserved = {
+                        "title": rec.get("title", title),
+                        "sid": rec.get("sid"),
+                        "full_text": rec.get("full_text"),
+                        "full_text_sha": rec.get("full_text_sha"),
+                        "obf_salt": rec.get("obf_salt")
+                    }
+
+                    # Reset the record
+                    new_rec = {k: v for k, v in preserved.items() if v is not None}
+                    new_rec["stage"] = "backlog"
+                    new_rec["daily_count"] = 0
+                    new_rec["weekly_count"] = 0
+                    new_rec["monthly_count"] = 0
+                    new_rec["mastered_count"] = 0
+                    # Don't set anchor_weekday yet - it will be set when moved to daily
+
+                    verses[key] = new_rec
+                    reset_count += 1
+                    _append_log(f"[backlog-reset] Reset state for '{title}'")
+
+        if reset_count > 0:
+            _save_state(state)
+            print(f"Reset {reset_count} item(s) in backlog.")
+
+    except Exception as e:
+        _append_log(f"[backlog-reset] ERROR: {e}")
+
+
+def cleanup_deleted_items():
+    """
+    Remove state entries for items that have been deleted from Reminders.
+    If an item is in state but not in any Reminders list, remove it from state.
+    This ensures deleted items stay deleted and don't get re-added.
+    """
+    try:
+        state = _load_state()
+        verses = state.setdefault("verses", {})
+
+        # Collect all titles from all Reminders lists
+        all_reminder_titles = set()
+        for list_name in [BACKLOG, DAILY, WEEKLY, MONTHLY, MASTERED]:
+            try:
+                items = list_reminders(list_name)
+                for item in items:
+                    title = item["name"].strip()
+                    all_reminder_titles.add(_norm_title(title))
+            except Exception as e:
+                _append_log(f"[cleanup] ERROR listing {list_name}: {e}")
+                continue
+
+        # Find state entries that don't exist in any Reminders list
+        to_delete = []
+        for key, rec in verses.items():
+            if key not in all_reminder_titles:
+                to_delete.append(key)
+
+        # Remove them from state
+        if to_delete:
+            for key in to_delete:
+                title = verses[key].get("title", key)
+                del verses[key]
+                _append_log(f"[cleanup] Removed deleted item from state: '{title}'")
+
+            _save_state(state)
+            print(f"Cleaned up {len(to_delete)} deleted item(s) from state.")
+
+    except Exception as e:
+        _append_log(f"[cleanup] ERROR: {e}")
+
+
 def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[str]:
     """
-    1) Clean ALL exact duplicates in Backlog that already exist in Daily/Weekly/Monthly.
-    2) Clean Backlog items that OVERLAP any existing title across lists (range-overlap).
-    3) Move the FIRST remaining Backlog item into Daily.
-       - Set due to next morning 08:00
-       - Init cadence state with today's weekday (anchor)
-       - Fill notes via API if blank
-       - CSV log "moved-from-backlog"
-    4) If Backlog is empty and frequency gate allows:
-       - Ask ChatGPT once for a contiguous reference (optionally guided by `topic`)
-       - Pass an exclusions list to avoid duplicates/overlaps
-       - If it still overlaps, skip (no further model calls)
-       - Create in Daily, set due 8:00, init state, fill notes
-       - CSV log "chatgpt-added"
-    Returns the moved/created title, or None if nothing done.
+    Add exactly one new verse to Daily, respecting the frequency gate for BOTH sources:
+      1) Backlog intake (after dedupe/overlap cleanup) → gated by every_n_days
+      2) ChatGPT fallback (only when Backlog is empty) → gated by every_n_days
+
+    Behavior:
+      - Cleans exact duplicates and range-overlaps from Backlog.
+      - If Backlog has items:
+          - If gate allows today → move the FIRST remaining item to Daily, set due, init state, ensure notes+SID.
+          - If gate does NOT allow → do nothing.
+      - If Backlog is empty:
+          - If gate allows today → try ChatGPT once; if non-overlapping, create in Daily, set due, init state, ensure notes+SID.
+          - If gate does NOT allow → do nothing.
+      - On either successful add/move, update 'last_auto_added' in state.
     """
     now = datetime.now()
 
@@ -925,11 +1026,18 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
             delete_by_id(BACKLOG, r["id"])
             print(f"Cleaned overlapping Backlog item: {title} (overlaps {overlapping})")
 
-    # -------- Pass 3: move the first remaining Backlog item to Daily --------
-    for r in list_reminders(BACKLOG):
+    # -------- Pass 3: Backlog intake (now gated) --------
+    backlog_items = list_reminders(BACKLOG)  # refresh again after overlap cleanup
+    if backlog_items:
+        if not _chatgpt_allowed_today(now):  # reuse the same gate for *any* new intake
+            print("[new-verse] Backlog has items, but frequency gate prevents intake today.")
+            return None
+
+        # Move the FIRST remaining Backlog item to Daily
+        r = backlog_items[0]
         title = r["name"].strip()
 
-        # Create in Daily
+        # Create in Daily (preserve any existing body text from Backlog)
         create_script = r'''
         on run argv
           set listName to item 1 of argv
@@ -941,25 +1049,28 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
           end tell
         end run
         '''
-        run_as(create_script, DAILY, title, r["body"])
+        run_as(create_script, DAILY, title, r.get("body",""))
 
         # Delete from Backlog
         delete_by_id(BACKLOG, r["id"])
 
-        # Due next morning 8:00 + init cadence + ensure notes
+        # Due next morning at configured time + init cadence + ensure notes + SID
         set_due_next_morning_8am(DAILY, title)
         _get_or_init_record(title, anchor_weekday=now.weekday())
         ensure_notes_for(DAILY, title)
         _ensure_sid_for_title(DAILY, title)
 
+        # Record the intake date for the frequency gate
+        _set_last_auto_added_date(now)
+
         # CSV log
-        next_due = next_morning_8am(now).strftime('%Y-%m-%d 08:00')
+        next_due = next_morning_8am(now).strftime('%Y-%m-%d %H:%M')
         _append_csv_event(title, "daily", "moved-from-backlog", next_due)
 
-        print(f"New verse moved from Backlog → Daily (next review at 8:00 AM): {title}")
+        print(f"New verse moved from Backlog → Daily (next review at {next_due.split(' ')[1]}): {title}")
         return title
 
-    # -------- Pass 4: Backlog empty → maybe ask ChatGPT --------
+    # -------- Pass 4: Backlog empty → ChatGPT (still gated) --------
     if not _chatgpt_allowed_today(now):
         print("[new-verse] Backlog empty, but frequency gate prevents auto-add today.")
         return None
@@ -994,14 +1105,16 @@ def maybe_add_new_verse_from_backlog(topic: Optional[str] = None) -> Optional[st
     ensure_notes_for(DAILY, candidate)
     _ensure_sid_for_title(DAILY, candidate)
 
+    # Record the intake date for the frequency gate (CHATGPT path)
     _set_last_auto_added_date(now)
 
     # CSV log
-    next_due = next_morning_8am(now).strftime('%Y-%m-%d 08:00')
+    next_due = next_morning_8am(now).strftime('%Y-%m-%d %H:%M')
     _append_csv_event(candidate, "daily", "chatgpt-added", next_due)
 
-    print(f"[ChatGPT] Added new verse to Daily (next review at 8:00 AM): {candidate}")
+    print(f"[ChatGPT] Added new verse to Daily (next review at {next_due.split(' ')[1]}): {candidate}")
     return candidate
+
 
 
 # ====================================================================
@@ -1174,24 +1287,25 @@ def _ensure_due_for_list(list_name: str, item: dict, now: Optional[datetime] = N
 
             anchor_wd = int(rec["anchor_weekday"])
 
-            # base on this month's "same day-of-month" at 8am
+            # Find first occurrence of anchor weekday in the current month
             y, m = now.year, now.month
-            dom = min(now.day, calendar.monthrange(y, m)[1])
-            base = at_8am(datetime(y, m, dom))
+            # Start from the 1st of the current month
+            base = at_8am(datetime(y, m, 1))
 
-            # if base already passed, start from next month same day-of-month
-            if base <= now:
-                # roll to next month
+            # Walk forward to first occurrence of anchor weekday in this month
+            delta = (anchor_wd - base.weekday()) % 7
+            target = base + timedelta(days=delta)
+
+            # If that date has already passed, move to next month
+            if target <= now:
+                # Move to next month
                 if m == 12:
                     y, m = y + 1, 1
                 else:
                     m += 1
-                dom = min(now.day, calendar.monthrange(y, m)[1])
-                base = at_8am(datetime(y, m, dom))
-
-            # walk forward to first occurrence of anchor weekday on/after base
-            delta = (anchor_wd - base.weekday()) % 7
-            target = base + timedelta(days=delta)
+                base = at_8am(datetime(y, m, 1))
+                delta = (anchor_wd - base.weekday()) % 7
+                target = base + timedelta(days=delta)
 
         else:
             return False  # unknown list, do nothing
@@ -1689,6 +1803,16 @@ def doctor():
     except Exception as e:
         print(f"[fix] canonicalize ERROR: {e}")
 
+       # Repair any legacy SID-only notes
+    try:
+        repaired = 0
+        for ln in (DAILY, WEEKLY, MONTHLY):
+            repaired += _repair_sid_only_notes_for_list(ln)
+        print(f"[fix] Repaired SID-only notes: {repaired}")
+    except Exception as e:
+        print(f"[fix] SID-only repair ERROR: {e}")
+ 
+
     # A) SID sweep
     total_added = 0
     for ln in (DAILY, WEEKLY, MONTHLY):
@@ -2067,6 +2191,10 @@ def _refresh_text_and_note(list_name: str, item: dict) -> bool:
 # SID helpers
 # ====================================================================
 def _ensure_sid_for_title(list_name: str, title: str) -> Optional[str]:
+    """
+    Ensure the reminder has a SID, but NEVER create a SID-only note.
+    If the note is blank, we first try to populate canonical text; only then append SID.
+    """
     items = list_reminders(list_name)
     it = next((x for x in items if _norm_title(x["name"]) == _norm_title(title)), None)
     if not it:
@@ -2074,16 +2202,55 @@ def _ensure_sid_for_title(list_name: str, title: str) -> Optional[str]:
 
     note_raw = get_body_by_id_raw(list_name, it["id"])
     sid = _extract_sid(note_raw)
-    if not sid:
-        sid = _new_sid()
-        new_body = _append_sid(note_raw, sid)
-        set_body_by_id(list_name, it["id"], new_body)
 
-    rec = _get_or_init_record(title)
-    if rec.get("sid") != sid:
-        _update_record(title, sid=sid)
+    # If SID exists, ensure state has it and return
+    if sid:
+        rec = _get_or_init_record(title)
+        if rec.get("sid") != sid:
+            _update_record(title, sid=sid)
+        return sid
 
-    return sid
+    # No SID yet — but if the body is blank, DO NOT append SID-only.
+    if not (note_raw or "").strip():
+        # Try to build the note first (state-first; else API)
+        if not _refresh_text_and_note(list_name, it):
+            _append_log(f"[sid] defer for '{title}' on '{list_name}': blank body and no text yet; not appending SID")
+            return None
+        # Re-read body after refresh
+        note_raw = get_body_by_id_raw(list_name, it["id"])
+
+    # Append a new SID safely now that the body has content (or is manual)
+    newsid = _new_sid()
+    new_body = _append_sid(note_raw, newsid)
+    if set_body_by_id(list_name, it["id"], new_body):
+        rec = _get_or_init_record(title)
+        if rec.get("sid") != newsid:
+            _update_record(title, sid=newsid)
+        return newsid
+
+    return None
+
+def _is_sid_only_note(s: str) -> bool:
+    """True if, after removing any [sid:UUID], nothing else remains."""
+    if not s:
+        return False
+    without_sid = re.sub(r"\[sid:[0-9a-fA-F-]{36}\]", "", s).strip()
+    return without_sid == ""
+
+def _repair_sid_only_notes_for_list(list_name: str) -> int:
+    """
+    Find notes that contain only a SID and try to rebuild them with canonical text.
+    Returns count of repaired notes.
+    """
+    fixed = 0
+    for it in list_reminders(list_name):
+        raw = get_body_by_id_raw(list_name, it["id"])
+        if _is_sid_only_note(raw):
+            if _refresh_text_and_note(list_name, it):
+                fixed += 1
+            else:
+                _append_log(f"[repair] still SID-only after refresh attempt: '{it.get('name','?')}' on '{list_name}'")
+    return fixed
 
 
 def _sha1(s: str) -> str:
@@ -2091,35 +2258,33 @@ def _sha1(s: str) -> str:
 
 def sid_sweep_for_list(list_name: str) -> int:
     """
-    Ensure every item in list_name has a SID, but never leave a 'SID-only' note.
-    - If body is blank: fill text first (state-first -> API), then append SID.
+    Ensure every item in list_name has a SID, but NEVER leave a 'SID-only' note.
+    - If body is blank: try to fill text first; if that fails, SKIP (no SID).
     - If body has text and no SID: append SID.
     Returns the number of SIDs newly added.
     """
     added = 0
     for it in list_reminders(list_name):
         body = (it.get("body") or "").strip()
-        has_sid = bool(_extract_sid_from_text(body))
+        has_sid = bool(_extract_sid_from_text(it.get("body") or ""))
         if has_sid:
             continue
 
-        # If the body is empty, fill canonical text first (so SID isn't the only content).
         if not body:
+            # Try to build canonical text; if it works, it will also ensure SID inside.
             if _refresh_text_and_note(list_name, it):
-                added += 1  # _ensure_sid_for_title() is called inside
+                added += 1  # _ensure_sid_for_title() is called inside refresh path
             else:
-                # Try a last-resort ensure (may no-op on manual_override)
-                if ensure_notes_for(list_name, it.get("name","")):
-                    _ensure_sid_for_title(list_name, it.get("name",""))
-                    added += 1
+                _append_log(f"[sid_sweep] skip SID-only risk for '{it.get('name','?')}' on '{list_name}': still blank after refresh")
             continue
 
-        # Body has text but no SID → append SID only
+        # Body has text but no SID → append SID
         sid = _ensure_sid_for_title(list_name, it.get("name",""))
         if sid:
             added += 1
 
     return added
+
 
 
 def _extract_sid_from_text(s: str) -> Optional[str]:
@@ -2201,12 +2366,14 @@ def _append_csv_event(title: str, stage: str, action: str, next_due: str = "") -
 def run_daily(topic_arg: Optional[str] = None):
     """
     One 'daily' run:
-      1) advance_on_complete()  # handles D/W/M/M* rescheduling & promotions
-      2) fill_notes_for_daily()
-      3) fill_notes_for_weekly()
-      4) fill_notes_for_monthly()
-      5) maybe_add_new_verse_from_backlog()
-      6) scheduled weekly '--fix' if due (config-driven; minimal overhead)
+      1) cleanup_deleted_items()  # remove deleted items from state
+      2) reset_backlog_items()  # reset state for items moved back to backlog
+      3) advance_on_complete()  # handles D/W/M/M* rescheduling & promotions
+      4) fill_notes_for_daily()
+      5) fill_notes_for_weekly()
+      6) fill_notes_for_monthly()
+      7) maybe_add_new_verse_from_backlog()
+      8) scheduled weekly '--fix' if due (config-driven; minimal overhead)
     """
     cfg = load_or_init_config()
     apply_config(cfg)
@@ -2215,6 +2382,18 @@ def run_daily(topic_arg: Optional[str] = None):
     topic = topic_arg if (topic_arg and topic_arg.strip()) else cfg_topic
 
     _append_log("run-daily: start")
+
+    try:
+        cleanup_deleted_items()
+        _append_log("run-daily: cleanup_deleted_items OK")
+    except Exception as e:
+        _append_log(f"run-daily: cleanup_deleted_items ERROR: {e}")
+
+    try:
+        reset_backlog_items()
+        _append_log("run-daily: reset_backlog_items OK")
+    except Exception as e:
+        _append_log(f"run-daily: reset_backlog_items ERROR: {e}")
 
     try:
         advance_on_complete()
