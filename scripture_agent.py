@@ -440,6 +440,7 @@ def set_due_date(list_name: str, reminder_id: str, when: datetime) -> bool:
         return False
 
 
+
 def set_due_next_morning_8am(list_name: str, title: str) -> bool:
     """Set due for the reminder (by title) to next morning at configured due time, via the id-based setter."""
     try:
@@ -900,8 +901,9 @@ def reset_backlog_items():
             title = item["name"].strip()
             key = _norm_title(title)
             rec = verses.get(key)
+            rid = item.get("id")
 
-            # Only reset if there's an existing state record
+            # Only reset state if there's an existing record
             if rec:
                 # Check if it needs resetting (has a stage other than backlog or has counts)
                 needs_reset = (
